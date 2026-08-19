@@ -1,0 +1,40 @@
+name: Release
+
+# Triggered by pushing a version tag, e.g.:
+#   git tag v1.0.1 && git push origin v1.0.1
+# module.json's "version" must match the tag (without the "v") — Foundry
+# reads the version from module.json, not the tag name.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify module.json version matches the tag
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          MANIFEST_VERSION="$(node -pe 'require("./module.json").version')"
+          if [ "$TAG_VERSION" != "$MANIFEST_VERSION" ]; then
+            echo "Tag v$TAG_VERSION does not match module.json version $MANIFEST_VERSION"
+            exit 1
+          fi
+
+      - name: Build module.zip (end-user files only)
+        run: |
+          zip -r module.zip module.json README.md LICENSE scripts proxy
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            module.json
+            module.zip
+          generate_release_notes: true

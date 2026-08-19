@@ -1,0 +1,34 @@
+{
+  "id": "dnd-brewporter",
+  "title": "D&D Brewporter",
+  "description": "Imports D&D 2024 class/subclass items from dnd2024.wikidot.com and homebrew subclasses from Google Docs (or similar free-form pages), resolving compendium UUIDs by name before creating world items — entirely from inside Foundry.",
+  "version": "1.0.0",
+  "compatibility": {
+    "minimum": "13",
+    "verified": "14.365"
+  },
+  "relationships": {
+    "systems": [
+      {
+        "id": "dnd5e",
+        "type": "system",
+        "compatibility": {
+          "minimum": "4.0.0"
+        }
+      }
+    ]
+  },
+  "esmodules": [
+    "scripts/main.mjs"
+  ],
+  "authors": [
+    { "name": "jdbl" }
+  ],
+  "url": "https://github.com/jdbl/dnd-brewporter",
+  "manifest": "https://github.com/jdbl/dnd-brewporter/releases/latest/download/module.json",
+  "download": "https://github.com/jdbl/dnd-brewporter/releases/download/v1.0.0/module.zip",
+  "readme": "https://github.com/jdbl/dnd-brewporter/blob/main/README.md",
+  "bugs": "https://github.com/jdbl/dnd-brewporter/issues",
+  "changelog": "https://github.com/jdbl/dnd-brewporter/releases",
+  "license": "https://github.com/jdbl/dnd-brewporter/blob/main/LICENSE"
+}

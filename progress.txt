@@ -1,0 +1,236 @@
+# wikidot-dnd-importer implementation progress
+Plan: /home/jbl/.claude/plans/ancient-stargazing-sparrow.md
+
+## Status
+- [x] 1.1 — Progression override map (Artificer)
+- [x] 1.2 — Tool Proficiencies trait
+- [x] 2.1 — Source detection branch (wikidot vs freeform)
+- [x] 2.2 — Google Docs URL rewrite
+- [x] 2.3 — freeform-scraper.mjs
+- [x] 2.4 — assembleSubclassItem refactor (shared by wikidot + freeform)
+- [x] 2.5 — Conditional review dialog
+- [x] 3.1 — wikidot-proxy.mjs
+- [x] 3.2 — importer.mjs tiered fetch (direct → proxy → manual) + status ping
+- [x] V1 — jsdom test: freeform fixture (Oath of Love) — exact match on name/classIdentifier/confidence/featuresByLevel/spellGrants
+- [x] V2 — jsdom test: Artificer fixture diff — progression="artificer" confirmed, Tool Proficiencies trait confirmed (grants + choices)
+- [x] V3 — proxy curl smoke test — health check + CORS header + successful fetch of both wikidot and Google Docs through it, all confirmed
+- [ ] V4 — manual in-Foundry run (needs the user — no GM credentials available)
+
+All code-level work (Parts 1–3) is complete and automated-tested. Only V4
+(an actual click-through inside the running Foundry client) remains, and it
+requires the user since there's no way to log in as GM without their
+credentials.
+
+## Notes / decisions log
+(most recent first — one entry per session, include date + what changed/was learned)
+
+- 2026-08-17 — session 1 — Implemented and verified the full plan in one pass:
+  - Part 1 (scraper.mjs): added PROGRESSION_OVERRIDES = {artificer: "artificer"}
+    applied after the heuristic in scrapeClass(); added TOOL_CODES (verified
+    against DND5E.tools) + parseToolProficiencies() wired into
+    buildAdvancement() as a new "Tool Proficiencies" Trait advancement,
+    generalized beyond just Artificer (benefits Rogue/Monk/etc too).
+  - Part 2.4 refactor: extracted assembleSubclassItem() out of scrapeSubclass()
+    in scraper.mjs, exported it — both the wikidot and freeform paths now
+    share it. Also exported slugify() (previously private) since
+    freeform-scraper.mjs needed it, and added isWikidotPage() as the cheap
+    routing check used by importer.mjs instead of exception-based branching.
+  - Part 3 (proxy): wikidot-proxy.mjs is a genuinely zero-dependency
+    node:http server, bound to 127.0.0.1:8091 only (remote/multi-user
+    config explicitly deferred per the plan). importer.mjs's fetchDirect()
+    was replaced with fetchWithFallback() — direct fetch, then proxy fetch,
+    then give up — and every created-item report row now shows which tier
+    actually worked (`via: "direct"|"proxy"|"folder"`). The main import
+    dialog pings /health on open and shows a live proxy status line.
+  - Part 2 (freeform): freeform-scraper.mjs is new. Key implementation
+    surprise not fully anticipated in the plan: Google Docs frequently joins
+    what are visually two lines with a bare <br> INSIDE one <p> (confirmed
+    on the real fixture — the "Oath of Love" / "A Paladin Subclass" title is
+    one <p>, not two) — textContent alone would run them together with no
+    separator. Had to write a dedicated extractLines() that walks child
+    nodes and splits at <br> boundaries; a naive per-<p> textContent
+    approach would have merged the subclass name and its "A X Subclass"
+    tagline into one unparseable string. Also had to explicitly strip
+    embedded <img> tags (and filter empty blocks) when building
+    descriptionHtml — the fixture doc has a large inline base64 image that
+    would otherwise bloat the created Item's description field enormously;
+    confirmed the stripped output does NOT contain "base64" anymore.
+  - importer.mjs wiring: isWikidotPage() check routes each fetched/loaded
+    source to scrapeWikidotHtml() or scrapeFreeformSubclass(); freeform
+    results with confidence < 2 go through a new reviewFreeformDialog()
+    (editable name/classIdentifier/level-feature rows, add/remove) before
+    assembleSubclassItem() is called — confidence >= 2 skips straight to
+    assembly, same one-click feel as wikidot.
+  - Verification: built a full end-to-end integration test
+    (scratchpad/moduletest/integration-test.mjs) mocking Item.create,
+    game.packs, ui.notifications, Dialog, FilePicker, and a local http
+    server serving the fixture files — ran importFromFolder() against both
+    cleric.html and oathoflove.html together in one call and confirmed both
+    routed correctly (class via wikidot path, subclass via freeform path,
+    confidence-gate correctly skipped the review dialog) and that UUID
+    resolution ran identically on both. Also re-ran the full pre-existing
+    class/subclass regression suite (12 classes + subclasses tested in
+    earlier sessions) — no regressions from any of this session's changes.
+  - Everything is code-complete and automated-verified except V4 (an actual
+    click-through in the live Foundry client), which needs the user.
+
+## Open questions / blockers
+- V4 needs the user: start the proxy (`node proxy/wikidot-proxy.mjs`), run
+  an import of a wikidot page and the Google Doc, confirm the dialog/report
+  look right, and report back. No other blockers.
+
+- 2026-08-19 — session 3 — User reported the import dialog said "local proxy
+  isn't running" even though it was. Investigated directly on the host:
+  `node proxy/wikidot-proxy.mjs` WAS running (confirmed via `lsof -i :8091`
+  and `curl http://localhost:8091/health` → "ok"), so this wasn't the proxy
+  actually being down. Root cause: runImport()'s dialog only ever called
+  checkProxyHealth() once, at render time — if the dialog was opened before
+  the proxy finished starting (or before it was started at all), the status
+  line froze on "not detected" for the dialog's whole lifetime with no way
+  to refresh short of closing and reopening it.
+  Fix: added a "(recheck)" link next to the status line — clicking it
+  re-runs checkProxyHealth() and updates the line in place, wired via a new
+  refreshProxyStatus() closure that both the initial render and the link's
+  click handler call. No change to checkProxyHealth() or the proxy itself,
+  both of which were confirmed already correct. node --check passed
+  (had to use the nvm-managed node directly — plain `node` isn't on PATH in
+  the sandboxed shell here, unrelated to the module).
+  Not yet re-verified inside a live Foundry client (still blocked on V4 for
+  the same credential reason as before) — worth confirming next session
+  that the recheck link actually flips the status line when clicked.
+
+- 2026-08-19 — session 3 (cont'd) — Traced the actual "could not fetch"
+  failure the user hit next: the failed-URL in their dialog read
+  `.../document/d/e/...export?format=html`, which is the tell for a Google
+  "Publish to web" link (`docs.google.com/document/d/e/2PACX-.../pub`) — a
+  different URL shape than the normal `/document/d/<ID>/edit` link.
+  resolveSourceUrl()'s regex would misparse that as if `"e"` were the doc
+  ID. User confirmed it actually was just a bad/wrong link pasted, not a
+  real gap in the code — no fix needed there, don't chase this further
+  unless it recurs with a confirmed-correct publish-link.
+
+  Separately, user asked for a real feature: when a scraped name matches
+  multiple compendium items ("ambiguous"), let them pick the right one from
+  a button in the report dialog instead of having to open the created
+  item's sheet and fix it by hand. Implemented in importer.mjs:
+  - resolveSlot()/resolveItemUuids() now take a `pending` accumulator and a
+    `path` (e.g. `system.advancement.<advId>.configuration.items.<i>.uuid`,
+    or `system.startingEquipment.<i>.key`) built from the exact array
+    index/advancement-id the entry lives at in the data object about to be
+    passed to Item.create — ambiguous results go there instead of straight
+    to report.unresolved.
+  - createItemFromData() attaches the newly-created item's real UUID to
+    each pending entry once Item.create succeeds, then pushes them into
+    report.unresolved (still shown as "Unresolved", now carrying
+    `path`/`candidates`/`itemUuid`). A "no match at all" result (nothing to
+    choose between) is unchanged — reported directly, no button.
+  - showReport() renders a "Choose…" button only on rows that have
+    `candidates`; clicking opens a small Dialog with a `<select>` of
+    `name — pack` options, and on Apply does
+    `(await fromUuid(itemUuid)).update({ [path]: chosenUuid })` — this
+    works because advancement `_id`s and array indices are stable between
+    the pre-creation data object and the created document, same assumption
+    already implicit in the old "go fix it on the item sheet" flow. The row
+    updates in place to show "✓ resolved to X" on success.
+  Verified: re-ran integration-test.mjs (still 7 items created, no
+  regressions — that fixture's empty `game.packs` means it never exercises
+  the ambiguous path, only proves nothing broke). Wrote a new targeted test
+  (scratchpad/moduletest/uuid-picker-test.mjs) with two fake packs both
+  containing "Divine Intervention" (a real Cleric feature name) to force an
+  ambiguous match, then simulated the full click → picker → Apply flow
+  through a real jsdom DOM (not just string assertions) — confirmed the
+  Choose… button renders, clicking it opens the picker, applying the
+  second candidate calls doc.update with the exact dot-path, the report row
+  flips to "✓ resolved to Divine Intervention", and the created item's data
+  contains the chosen pack's UUID and NOT the unchosen one.
+  README updated with a short "Ambiguous matches can be fixed from the
+  report" section.
+
+- 2026-08-19 — session 3 (cont'd again) — User came back with a real
+  "Publish to web" doc URL (`docs.google.com/document/d/e/2PACX-.../pub`)
+  that genuinely failed — this was NOT just a bad link like the earlier
+  false alarm. Fetched it directly and found two separate real bugs, both
+  fixed:
+  1. resolveSourceUrl() (scraper.mjs) — the `/d/e/<id>/` pattern is a
+     different, opaque ID scheme from a normal `/d/<id>/edit` link, but the
+     old regex matched the "e" as if it were a normal doc ID, producing a
+     broken `.../document/d/e/export?format=html` URL (404s). Fixed by
+     checking for the `/d/e/` pattern first and, for that case, returning
+     the `/pub` URL unchanged — published docs are ALREADY the plain
+     fetchable HTML page, no `/export` rewrite needed or possible.
+  2. freeform-scraper.mjs's root-element selection — a normal
+     export?format=html page has its content as direct children of <body>
+     (which itself carries the class "doc-content"), but a /pub page nests
+     the same per-paragraph markup inside `<div id="contents"><div
+     class="... doc-content">` — several levels deeper. The scraper only
+     ever looked at `doc.body.children` (top level only, no recursion by
+     design), so it saw nothing and would throw "Could not find any
+     readable text". Fixed by scanning `doc.querySelector(".doc-content")
+     ?? doc.body` instead — resolves to <body> itself for the export-html
+     case (same class is present there) and to the correct nested div for
+     the /pub case, verified by inspecting both real fixtures' DOM
+     structure directly.
+  Also found and fixed a third, more subtle bug while verifying against
+  this new real fixture: the title-line detection assumed the title block
+  is always exactly 2 lines (name, then "A X Subclass" tagline) — true for
+  Oath of Love, but this doc's title block is 3 lines ("Otherworldly
+  Patron:" / "The Dragon" / "A Warlock Subclass"), so the old code grabbed
+  "Otherworldly Patron:" as the name and never even looked at the 3rd line
+  for the tagline (classIdentifier came out null). Since this doc's feature
+  headings are unambiguous, confidence (6) was well above the review
+  threshold (2), so this would have silently created a subclass named
+  "Otherworldly Patron:" with no review step to catch it — worse than an
+  outright failure. Fixed by buffering every substantial line seen before
+  hitting *either* a tagline match or the first level-heading; on a tagline
+  match, name = whichever buffered line came immediately before it (not
+  necessarily line 1); with no tagline ever found, falls back to the old
+  "first line = name" behavior. Verified against both fixtures side by
+  side: Oath of Love's name/classIdentifier/confidence/featuresByLevel are
+  byte-identical to before (no regression), and the Dragon doc now comes
+  out as name="The Dragon", classIdentifier="warlock", confidence=6, with
+  all 4 level/6 feature pairs correct. Full existing regression suite
+  (12 classes + 3 subclasses + Artificer + integration test) still passes.
+  README updated to document that both Google Docs link types are
+  supported and why they need different handling.
+
+- 2026-08-19 — session 2 — User reported that freeform-sourced homebrew
+  features (e.g. "Loving Embrace" in Oath of Love's Channel Divinity) were
+  failing to resolve — correctly, since they're original content with no
+  compendium equivalent to look up at all, unlike wikidot features which
+  always reference something real. Root cause: freeform-scraper.mjs was
+  capturing feature *names* for the ItemGrant but discarding all the prose
+  that followed each heading — the actual mechanical text was being thrown
+  away entirely, not just left unresolved.
+  Fix: freeform-scraper.mjs now tracks each detected heading as an "active
+  feature" and accumulates every block between it and the next heading (or
+  end of doc) into that feature's own `descriptionHtml`, returned as a new
+  `featureDetails: [{level, name, descriptionHtml}]` array alongside the
+  existing `featuresByLevel` (kept as-is for the review dialog and
+  confidence calc, which only care about names). importer.mjs's
+  handleFreeformResult() now creates a real `type: "feat"` Item for each
+  feature it has captured prose for (schema verified against dnd5e's own
+  shipped Disciple of Life source — `system.type.value: "class"` is used
+  for both class AND subclass features, no separate subtype), and passes
+  its real UUID straight into the subclass's ItemGrant — no FIXME, no
+  lookup needed. scraper.mjs's buildSubclassAdvancement() was extended
+  (backward compatible) to accept either a bare name string (wikidot path —
+  unchanged, still produces a FIXME/lookup placeholder) or a `{name, uuid}`
+  pair (freeform path — uuid already real). Spells inside "Oath Spells"
+  etc. are untouched by this — those genuinely are real PHB spells and
+  still go through normal compendium lookup, only each subclass's own named
+  features get auto-generated as new items.
+  Verified: re-ran the full integration test — the report now shows 5 real
+  generated Feature items for Oath of Love (Oath Spells, Channel Divinity,
+  Aura of Love, Empowered by Love, Knight of Hearts), confirmed the
+  Channel Divinity item's description literally contains "Loving Embrace"
+  and "Galvanizing Affection" in full, confirmed the subclass's own
+  ItemGrant entries hold real UUIDs with no FIXME hint field, and confirmed
+  the "Unresolved" report section now only lists the real spells (Bless,
+  Haste, ...) that still need compendium lookup — the homebrew features no
+  longer appear there at all. Full regression suite (12 classes + 3
+  subclasses + Artificer) still passes unchanged.
+  Edge case documented but not fully solved: if a low-confidence freeform
+  parse goes through manual review and the user renames a detected feature,
+  the renamed row won't match its captured description (matched by exact
+  level+name) and falls back to the normal FIXME/lookup path instead —
+  acceptable given that path is already the "more manual" tier.
