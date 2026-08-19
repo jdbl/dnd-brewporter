@@ -1,4 +1,4 @@
-# wikidot-dnd-importer implementation progress
+# dnd-brewporter (formerly wikidot-dnd-importer) implementation progress
 Plan: /home/jbl/.claude/plans/ancient-stargazing-sparrow.md
 
 ## Status
@@ -192,6 +192,57 @@ credentials.
   (12 classes + 3 subclasses + Artificer + integration test) still passes.
   README updated to document that both Google Docs link types are
   supported and why they need different handling.
+
+- 2026-08-19 — session 4 — Prepped for public distribution per user request
+  ("how do i make it so this can be distributed like other add on
+  modules"). User chose: GitHub repo + Releases (the standard way most
+  community Foundry modules are distributed, no official-listing approval
+  needed), repo https://github.com/jdbl/dnd-brewporter, MIT license.
+  - Renamed the module id/folder/title from "wikidot-dnd-importer" /
+    "Wikidot D&D Importer" to "dnd-brewporter" / "D&D Brewporter" to match
+    the chosen repo name — updated module.json's id, importer.mjs's
+    exported MODULE_ID constant (used throughout for settings/macro/flag
+    keys), and the folder itself
+    (Data/modules/wikidot-dnd-importer -> Data/modules/dnd-brewporter).
+    NOTE for whoever does V4: since the module id changed, Foundry will see
+    this as a distinct module from whatever was enabled before — it needs
+    to be (re)enabled in the world's Manage Modules screen, and the
+    "importFolder" setting will be back at its default until reconfigured
+    (settings are stored per module id).
+  - module.json filled out with the full manifest-install field set: url,
+    manifest (github.com/.../releases/latest/download/module.json — a
+    stable link that always resolves to the newest release), download
+    (pinned to the v1.0.0 release's module.zip — must be bumped alongside
+    "version" on every future release), readme, bugs, changelog, license.
+  - Added LICENSE (MIT, copyright jdbl 2026).
+  - Added README "## Installation" section with the manifest URL end users
+    paste into Foundry's Install Module screen.
+  - Added .github/workflows/release.yml: on any "v*" tag push, verifies
+    the tag matches module.json's version (fails loudly if someone forgets
+    to bump one), zips only the end-user-relevant files (module.json,
+    README.md, LICENSE, scripts/, proxy/ — deliberately excludes
+    progress.txt, which stays in the git history for anyone curious but
+    isn't part of what installers download), and publishes a GitHub
+    Release with module.json + module.zip attached (matching what the
+    manifest/download URLs above expect to find).
+  - git init'd the module folder itself (previously untracked — the outer
+    /media/jbl/Secondary/Repos/Scraper working directory is a separate,
+    unrelated non-git folder). Set repo-local (not global) git identity
+    per explicit user confirmation: jdbl / jerry.b.lacy@gmail.com. Made the
+    initial commit, added origin remote (https://github.com/jdbl/
+    dnd-brewporter.git) — NOT pushed yet, waiting on the user to confirm
+    the GitHub repo exists/is ready before pushing.
+  - Verified nothing broke from the rename: updated all scratchpad test
+    scripts' hardcoded old-path references, re-ran the full suite (12
+    classes + 3 subclasses + Artificer + freeform Oath-of-Love +
+    integration test + the ambiguous-UUID-picker test) — all still pass
+    identically.
+
+## Open questions / blockers (updated)
+- Still waiting on: (a) user to confirm the GitHub repo is created/ready so
+  the initial push + first tagged release (v1.0.0) can happen, (b) V4 (an
+  actual manual in-Foundry click-through — note the module needs
+  re-enabling under its new id first, see above).
 
 - 2026-08-19 — session 2 — User reported that freeform-sourced homebrew
   features (e.g. "Loving Embrace" in Oath of Love's Channel Divinity) were
