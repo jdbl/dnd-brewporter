@@ -53,7 +53,7 @@ const PACT_SLOT_COL = /^(Spell Slots|Slot Level)$/i;
 const LEVEL_HEADING = /^Level\s+(\d+):\s*(.+)$/i;
 const SPELL_TABLE_HEADER = /Spells?$/i;
 
-function randomId(len = 16) {
+export function randomId(len = 16) {
   const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
   let out = "";
   for (let i = 0; i < len; i++) out += chars[Math.floor(Math.random() * chars.length)];
@@ -62,6 +62,40 @@ function randomId(len = 16) {
 
 export function slugify(text) {
   return text.toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
+}
+
+// Strips the "FIXME: " / "FIXME spell: " prefix a not-yet-resolved slot
+// carries and any trailing parenthetical qualifier the wiki adds but the
+// compendium name doesn't (e.g. "Indomitable (One Use)" -> "Indomitable").
+// Shared by importer.mjs's name-lookup and effects-builder.mjs's "copy from
+// compendium" search so both match compendium names the same way.
+export function normalizeName(name) {
+  return String(name)
+    .replace(/^FIXME(\s+spell)?:\s*/i, "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s*\([^)]*\)\s*$/, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// Substring search over a name index (as built by importer.mjs's
+// buildNameIndex) — used by the "no match found" rows in the problem-imports
+// dialog and by effects-builder.mjs's "copy from compendium" picker.
+export function searchIndex(index, rawQuery, limit = 15) {
+  const q = normalizeName(rawQuery);
+  if (!q) return [];
+  const results = [];
+  for (const [key, candidates] of index.entries()) {
+    if (key.includes(q)) results.push(...candidates);
+  }
+  results.sort((a, b) => {
+    const an = normalizeName(a.name), bn = normalizeName(b.name);
+    const aPrefix = an.startsWith(q) ? 0 : 1;
+    const bPrefix = bn.startsWith(q) ? 0 : 1;
+    return aPrefix !== bPrefix ? aPrefix - bPrefix : an.localeCompare(bn);
+  });
+  return results.slice(0, limit);
 }
 
 function abilityCode(name) {
@@ -528,9 +562,27 @@ function buildSubclassDescription(content) {
 
 function parseSubclassContent(content) {
   const featuresByLevel = {};
+  // Prose captured between one feature's own "Level N: Name" heading and the
+  // next (or end of section) — a wikidot feature is normally assumed to
+  // already exist as a real compendium item and only needs its UUID looked
+  // up by name (see resolveSlot() in importer.mjs), but when that lookup
+  // comes up empty this is what lets the review dialog offer "create a new
+  // feature" with the real page text instead of leaving a nameless blank.
+  const featureDetails = [];
   const spellGrants = [];
   const scaleColumns = {};
   let lastNonLevelHeading = null;
+  let activeFeature = null; // { level, name, blocks: [] }
+
+  const finalizeActiveFeature = () => {
+    if (activeFeature) {
+      featureDetails.push({
+        level: activeFeature.level,
+        name: activeFeature.name,
+        descriptionHtml: activeFeature.blocks.map((el) => el.outerHTML).join(""),
+      });
+    }
+  };
 
   for (const el of Array.from(content.children)) {
     const tag = el.tagName;
@@ -539,18 +591,26 @@ function parseSubclassContent(content) {
       const t = text(el).replace(/\s+/g, " ");
       const m = tag === "H3" ? t.match(LEVEL_HEADING) : null;
       if (m) {
+        finalizeActiveFeature();
         const level = parseInt(m[1], 10);
-        (featuresByLevel[level] ??= []).push(m[2].trim());
+        const name = m[2].trim();
+        (featuresByLevel[level] ??= []).push(name);
+        activeFeature = { level, name, blocks: [] };
       } else {
         lastNonLevelHeading = t;
+        activeFeature?.blocks.push(el);
       }
       continue;
     }
 
     if (tag === "TABLE" && el.classList.contains("wiki-content-table")) {
       const headers = Array.from(el.querySelector("tr")?.querySelectorAll("th") ?? []).map((th) => text(th));
-      if (!headers.length || !/Level$/i.test(headers[0])) continue;
+      if (!headers.length || !/Level$/i.test(headers[0])) { activeFeature?.blocks.push(el); continue; }
 
+      // Spell grants and scale columns are captured into their own structured
+      // fields below, so (unlike an ordinary paragraph) the table itself
+      // isn't also appended to the feature's prose — it'd just be the same
+      // data twice.
       if (headers.length >= 2 && SPELL_TABLE_HEADER.test(headers[1])) {
         Array.from(el.querySelectorAll("tr")).slice(1).forEach((row) => {
           const cells = row.querySelectorAll("td");
@@ -574,10 +634,14 @@ function parseSubclassContent(content) {
           }
         });
       }
+      continue;
     }
-  }
 
-  return { featuresByLevel, spellGrants, scaleColumns };
+    activeFeature?.blocks.push(el);
+  }
+  finalizeActiveFeature();
+
+  return { featuresByLevel, featureDetails, spellGrants, scaleColumns };
 }
 
 function buildSubclassAdvancement({ featuresByLevel, spellGrants, scaleColumns }) {
@@ -742,8 +806,9 @@ function scrapeSubclass(doc, content, sourceUrl) {
   const fallbackClassSlug = sourceUrl?.includes(":") ? sourceUrl.split(":").pop().split("/").pop() : null;
   const classIdentifier = deriveClassIdentifierFromBreadcrumb(doc, fallbackClassSlug);
   const descriptionHtml = buildSubclassDescription(content);
-  const { featuresByLevel, spellGrants, scaleColumns } = parseSubclassContent(content);
-  return assembleSubclassItem({ name: subclassName, classIdentifier, descriptionHtml, featuresByLevel, spellGrants, scaleColumns });
+  const { featuresByLevel, featureDetails, spellGrants, scaleColumns } = parseSubclassContent(content);
+  const result = assembleSubclassItem({ name: subclassName, classIdentifier, descriptionHtml, featuresByLevel, spellGrants, scaleColumns });
+  return { ...result, featureDetails };
 }
 
 // Cheap check used to route between this parser and the freeform one

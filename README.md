@@ -104,15 +104,60 @@ lookup/FIXME path. Spells referenced in an "Oath/Domain/Circle Spells"
 table are unaffected by any of this — those are real existing spells and
 still go through the normal compendium lookup.
 
-### Ambiguous matches can be fixed from the report, not just the item sheet
+### Problem imports can be fixed from the report, not just the item sheet
 
-When a name matches more than one compendium item (rare, but happens — e.g.
-identically-named items across packs), the report lists it under
-"Unresolved" with a **Choose…** button instead of just leaving you to hunt
-it down on the item sheet. Clicking it shows the specific candidates (name +
-pack) to pick from; picking one writes that UUID straight into the created
-item. A name with **no** match at all still has nothing to pick from, so it
-stays a plain "needs a manual fix" line as before.
+Anything the importer couldn't resolve by name shows up in the report under
+"Problem Imports", with a **Review & Fix…** button that opens a dialog
+instead of leaving you to hunt it down on the item sheet:
+
+- **Ambiguous** (a name matches more than one compendium item — rare, but
+  happens with identically-named items across packs): pick from the specific
+  candidates shown (icon, name, pack, type); picking one writes that UUID
+  straight into the created item.
+- **No match at all**: a live search box lets you hunt through every indexed
+  compendium item by name and attach one the same way. If nothing in your
+  compendiums is the right thing — common for 2024 PHB subclass features
+  that aren't SRD content, so they simply aren't in a free install's
+  compendium — a **+ Create new Feature item** button builds a real Feature
+  item instead, using the actual prose scraped from the source page as its
+  description (wikidot pages only; the row says whether page text was
+  found), and attaches that new item's UUID the same way a compendium match
+  would be.
+
+Either way the row updates in place to show what it was resolved to.
+
+### Attaching effects and activities to a created feature
+
+Clicking **+ Create new Feature item** opens a "Build Feature" step before
+the item is actually created, so you can give it mechanical teeth instead of
+just a name and description:
+
+- **+ New Effect** — a standard Foundry ActiveEffect: name, whether it
+  applies automatically or the player toggles it on, duration, and a
+  repeatable list of changes (key + mode + value/formula).
+- **+ New Activity** — pick a type (Save, Damage, Heal, Utility, or Cast) and
+  fill in a form built for that type specifically: saving-throw ability and
+  DC (spellcasting ability, a custom formula, or a fixed number),
+  damage/healing parts with a formula + damage type each, and so on. Cast
+  grants casting an existing spell without a slot — search for the spell the
+  same way you'd search for a compendium match elsewhere in this dialog, and
+  set a limited-uses formula (e.g. `@abilities.cha.mod`) with a recovery
+  period if it isn't unlimited. Any activity can also be linked to one or
+  more of the effects already queued below (e.g. a Save that applies an
+  effect on a failed save) via a checklist in its form — only effects
+  already in the queue can be linked, so add the effect first.
+- **+ Copy from Compendium…** — search any indexed compendium item by name
+  (same search used for "no match" rows), see its existing effects and
+  activities, and pick one to copy as a starting point — it opens pre-filled
+  in the same editor above so you can tweak it before adding it.
+
+Every formula field has an "Insert:" row of buttons/dropdown for common
+roll-data references (an ability modifier, proficiency bonus, character
+level, feature level) so you don't have to remember the exact syntax.
+Everything queued shows up in a running list with a Remove button; clicking
+**Create Feature** builds the item with all of it attached, and it's all
+still fully editable afterward on the item's own sheet — nothing here is a
+one-way trip. **Cancel** on this step cancels creating the feature entirely.
 
 ## Matching rules
 

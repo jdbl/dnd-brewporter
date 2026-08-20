@@ -24,6 +24,241 @@ credentials.
 ## Notes / decisions log
 (most recent first — one entry per session, include date + what changed/was learned)
 
+- 2026-08-20 — session 8 — First real live-Foundry test of the effects
+  builder (V4 finally happened, at least partially — user tried creating
+  "Steps of the Fey" with a Cast activity in their actual world) and it
+  failed. User pasted the full browser console output, which nailed it
+  immediately:
+  `DataModelValidationError: [...Activity...] spell.challenge.save: must be
+  a number` — confirming the exact risk flagged in sessions 6/7: the Cast
+  activity's `spell.challenge` shape was guessed wrong. It's a flat
+  `{attack: <number|null>, save: <number|null>}` DC/attack-bonus override
+  pair, not the nested `{ability, dc}` save-config object
+  buildActivityData() ("cast" branch, effects-builder.mjs) was building.
+  Fixed: `challenge: { attack: null, save: null }` — null leaves the cast
+  spell's own attack/DC in effect, which is the right default for "cast an
+  existing spell" rather than overriding it.
+  Also found and fixed a real bug in importer.mjs's own error handling
+  while diagnosing this: Foundry's Item.create() did NOT reject its promise
+  on this validation failure — it logged the DataModelValidationError via
+  its own Hooks.onError and resolved with `undefined` instead. Our code
+  unconditionally did `created.name`, crashing with a confusing, unrelated-
+  looking "Cannot read properties of undefined (reading 'name')" that
+  masked the real cause. Added a guard right after `Item.create()`: if
+  `created` is falsy, throw a clear error pointing at the browser console
+  instead of crashing — this protects against any future/unknown
+  validation failure being silently swallowed the same way, not just this
+  specific field.
+  Verified: extended buildActivityData("cast", ...) call directly (no
+  Foundry needed to check the plain data shape) — confirms
+  `spell.challenge` is now `{attack: null, save: null}`. Re-ran
+  effects-builder-test.mjs and the full existing suite — all still pass
+  (the test harness doesn't validate against the real dnd5e schema, so it
+  wouldn't have caught this itself — this was only found because the user
+  tried it live and pasted the actual error; a reminder that this class of
+  schema-shape bug needs a real Foundry client to catch, not just the jsdom
+  harness).
+  Other spell.* fields (ability, level, properties, uuid) were NOT flagged
+  in this error and are left as before — Foundry's validator may report
+  only the first failure per subtree, so there's a real chance another
+  field errors out next once this one's fixed; asked the user to retry and
+  report back if so.
+
+- 2026-08-20 — session 7 — User asked how http://dnd2024.wikidot.com/
+  warlock:archfey-patron's "Steps of the Fey" (Level 3) would be entered
+  with session 6's new effects/activities builder — a good real stress
+  test since it has three distinct mechanical parts: (1) cast Misty Step
+  at-will (Cha-mod times/day, recharges on Long Rest), (2) a "Refreshing
+  Step" option granting 1d10 Temp HP, (3) a "Taunting Step" option: a
+  Wisdom save or the target gets Disadvantage on attacks against others.
+  Walked through it and found two real gaps: no "Cast" activity type (for
+  #1), and no way to link an Activity to an Effect (for #3's save-fail
+  consequence). User confirmed: add both.
+  - Added a 5th activity type, Cast (castActivityFormHtml/buildActivityData
+    "cast" branch in effects-builder.mjs): reuses the same searchIndex()
+    compendium-search pattern as "no match" rows and Copy-from-Compendium to
+    pick the spell (stores its uuid in `spell.uuid`), plus a uses-formula +
+    recovery-period pair that lives on the activity's own base `uses` field
+    (already present in buildActivityData's `base` — Cast didn't need a new
+    field there, just UI to set it).
+  - Added Activity→Effect linking: commonActivityFieldsHtml() (shared by
+    all 5 activity-type forms) now also renders a checklist of whatever
+    Effects are already in the current Build Feature queue — an activity
+    can only link to something that already exists, so effects queued
+    later aren't offered retroactively (add the effect first). Checked
+    boxes become `activity.effects = [{_id: <real queued effect's _id>}]`
+    in buildActivityData(), replacing the old hardcoded `effects: []`.
+    activityDataToPrefill() (used when copying an activity from a
+    compendium item) deliberately does NOT carry over the source's own
+    `act.effects` — those _ids point at the source item's effects, which
+    don't exist on the new feature, so carrying them over would just
+    dangle; the user re-links against the current queue instead. That
+    function also went async (needs to fromUuid() the copied spell's name
+    for the Cast case) — updated the one call site in
+    showBuildFeatureDialog() to await it.
+  Verified by extending effects-builder-test.mjs (jsdom): a Save activity
+  now shows a working "Charm Immunity" checkbox (the effect added earlier
+  in the same test) and the built activity's `effects` field matches that
+  effect's real `_id` exactly; a Cast activity searches a fake compendium
+  for "Misty Step", selects it, and the built data has the correct
+  `spell.uuid`, `uses.max` formula, and `uses.recovery` shape. Re-ran the
+  full existing suite (12 classes + 3 subclasses + Artificer + freeform +
+  diff-test + integration-test + session-5's no-match test) — unaffected.
+  Same caveat as session 6 still applies to the Cast shape specifically
+  (`spell.uuid`/`spell.challenge`/`spell.level`/`spell.properties` fields
+  built from documented/training knowledge of dnd5e's CastActivityData, not
+  live-verified — V4 still blocked). README's activity list updated to
+  mention Cast and the linked-effects checklist.
+
+- 2026-08-19 — session 6 — User asked, as a follow-up to session 5's "Create
+  new Feature item" action, for an easy way to attach effects/activities to
+  a created feature: differentiate between effect and activity, choose an
+  existing one from a compendium item as a starting point, and get help with
+  formulas. Asked clarifying questions first (AskUserQuestion) rather than
+  guessing scope; user chose: surface it as a step on the "Create new
+  Feature item" button (not a separate report action), "choose existing"
+  means copy an effect/activity off another compendium item (not a fixed
+  template list), and a full field-aware builder (typed forms per
+  activity/effect shape, not just a raw-formula text box).
+  Implemented as a new scripts/effects-builder.mjs module:
+  - Moved normalizeName()/searchIndex() (previously importer.mjs-local) and
+    exported randomId() into scraper.mjs so both importer.mjs and the new
+    module can share them without a circular import — pure move, verified
+    byte-identical behavior via the existing test suite.
+  - buildActiveEffectData()/parseActiveEffectForm(): standard Foundry core
+    ActiveEffect schema (changes[], duration, transfer) — low risk, this
+    part of the schema is well-established and unlikely to have drifted.
+  - buildActivityData()/parseActivityForm(): dnd5e Activities for 4 types
+    (Save, Damage, Heal, Utility — Attack/Check deliberately left out of
+    this pass to bound scope, since they're less relevant to passive class
+    features than to weapons/spells). Damage/healing formulas always go
+    through the activity schema's `custom: {enabled:true, formula}` escape
+    hatch rather than the structured dice (number/denomination) fields, so
+    any formula the user types is honored as-is regardless of dice-string
+    parsing edge cases.
+  - showCopyFromCompendiumDialog(): reuses the search-index UI pattern,
+    loads the picked item via fromUuid(), lists its real .effects and
+    system.activities, and on pick deep-clones the raw data (via
+    .toObject() when available, i.e. a real Document, falling back to the
+    plain object as-is) with a fresh _id, then routes it through the same
+    structured editor (via activeEffectDataToPrefill()/
+    activityDataToPrefill() reverse-mappers) so it's pre-filled but still
+    editable before being added — not copied blind.
+  - Formula fields share an "Insert:" token row (ability-modifier dropdown +
+    prof/character-level/feature-level buttons) that inserts at whichever
+    .wikidot-formula-input last had focus, via a small insertAtCursor()
+    helper.
+  - showBuildFeatureDialog() is the entry point importer.mjs's "+ Create new
+    Feature item" handler now awaits before building the item's data —
+    resolves {effects, activities} (both possibly empty) on "Create
+    Feature", or null to cancel the whole creation. Wired in before the
+    existing Item.create() call: `if (built.effects.length) data.effects =
+    built.effects;` etc.
+  Verified with a new jsdom test (effects-builder-test.mjs) that upgrades
+  the Dialog mock beyond prior sessions' tests — it now actually renders
+  `buttons` as real clickable DOM elements wired to their callbacks (prior
+  mocks only handled two hardcoded dialog titles and never exercised
+  buttons at all), so nested Promise-resolving dialogs can be driven
+  end-to-end. Confirmed, against the real archfey-patron page: the Build
+  Feature dialog opens on clicking Create-new-Feature; a manually-filled New
+  Effect is added to the running queue (also verified the repeatable
+  change-row add/remove wiring); a manually-filled Save Activity (flat DC
+  15, Wisdom save, 2d10 psychic damage, "no effect" on save) is added and
+  its built data has the exact expected shape; Copy-from-Compendium finds a
+  planted fake item, lists its one effect and one activity, and picking the
+  effect opens a SECOND New Effect dialog correctly pre-filled with the
+  copied name/key/value; the final created Item has both effects (2) and
+  the one activity attached with correct data. Also re-ran the full existing
+  suite (12 classes + 3 subclasses + Artificer + freeform + diff-test +
+  integration-test + the session-5 no-match/create-feature tests) — no
+  regressions from the scraper.mjs helper move. (One of session 5's own
+  scratchpad tests, archfey-create-feature-test.mjs, now fails because its
+  Dialog mock predates the new "Build Feature" intermediate step and never
+  learned about it — not a real regression, superseded by
+  effects-builder-test.mjs which covers the same scenario plus this
+  session's additions.)
+  Known caveat, called out to the user: the exact Activity schema
+  (especially save.dc.calculation's valid values) is built from documented/
+  training knowledge of the dnd5e v3/v4 Activities model, not verified
+  against a live Foundry client — V4 (real in-Foundry click-through) has
+  been blocked since session 1 for lack of GM credentials. If Foundry logs
+  schema warnings or a field doesn't show right on the Activity sheet after
+  a real test, the fix is narrow (just that field's shape in
+  buildActivityData()) since the rest of the flow (dialog wiring, queueing,
+  ActiveEffect creation) is verified independent of that risk. Everything
+  built here also remains fully hand-editable afterward on the item's own
+  sheet regardless.
+  README gained a "Attaching effects and activities to a created feature"
+  section under the Problem Imports docs.
+
+- 2026-08-19 — session 5 — User reported that importing
+  http://dnd2024.wikidot.com/warlock:archfey-patron left features like
+  "Beguiling Defenses" as an empty, unlabeled Subclass Feature grant with no
+  way to tell what it was or fix it. Traced two layered problems:
+  1. There was already an *uncommitted*, undocumented "Problem Imports"
+     dialog redesign sitting in the working tree from an earlier,
+     un-logged session — it turned the old "no match found" case (which
+     went straight to a dead-end report.unresolved line with no path/
+     itemUuid, i.e. literally unfixable) into a proper pending/review entry
+     with a live compendium search box, same as the existing ambiguous-match
+     picker. This alone fixes "no indication of what it was" and "no option
+     to fix it" — verified against the real archfey-patron.html fetched
+     live from wikidot, confirmed the pre-fix bug reproduces exactly
+     (`{"uuid":"","optional":false}`, no name, nothing to click) and that
+     this dialog's search-and-attach flow works end-to-end.
+  2. It still didn't fully solve the user's ask ("or any option to create
+     the feature") — search-and-attach only helps if the compendium
+     actually has the thing, and Beguiling Defenses is 2024-PHB Warlock
+     content that plenty of installs (SRD-only compendium, no official
+     content module) simply won't have indexed at all, near-miss or not.
+     Added a "+ Create new Feature item" action to the no-match rows:
+     - scraper.mjs's parseSubclassContent() now tracks an "active feature"
+       (mirroring freeform-scraper.mjs's approach) and accumulates the
+       prose blocks between one "Level N: Name" heading and the next into a
+       new `featureDetails: [{level, name, descriptionHtml}]` return value
+       — recognized spell/scale tables are still parsed structurally and
+       deliberately NOT duplicated into the prose (matches freeform's
+       spell-table exclusion). scrapeSubclass() threads this through
+       scrapeWikidotHtml()'s return value.
+     - importer.mjs: resolveItemUuids()/resolveSlot() take an optional
+       featureDetails/descByName lookup and attach `descriptionHtml` to any
+       "no match" pending entry when the page had prose for that name.
+       createItemFromData() and both call sites (importFile,
+       importFetchedPage) now thread featureDetails through.
+     - The review dialog's no-match rows gained a "+ Create new Feature
+       item" button (next to the existing search box) that calls the
+       already-existing buildFeatureItemData() (previously freeform-only)
+       with the row's name + scraped descriptionHtml + the level read back
+       off the parent subclass document's own advancement entry (parsed
+       out of the pending entry's dot-path, no new field needed), creates a
+       real Item, logs it to report.created, and applies it via the same
+       applyResolution() the search flow uses.
+  Verified with a new jsdom test against the real fetched archfey-patron
+  page (no fixture-writing needed — curled it live) with a fake compendium
+  that has zero entries anywhere close to "Beguiling Defenses": confirmed
+  the create button renders, creates a real `type: "feat"` item whose
+  description contains the actual scraped prose ("immune to the Charmed
+  condition", the Reaction paragraph, ...), correct level (10) and
+  `requirements` (parent subclass name) fields, and that the subclass's own
+  ItemGrant slot ends up pointing at its real UUID. Re-ran the full existing
+  suite (12 classes + 3 subclasses + Artificer + freeform Oath-of-Love +
+  diff-test byte-comparison + integration-test) — all unchanged, confirming
+  the parseSubclassContent() restructuring didn't alter featuresByLevel/
+  spellGrants/scaleColumns output for any existing fixture.
+  README's "Ambiguous matches..." section rewritten as "Problem imports...”
+  to document the unified dialog (ambiguous picker + no-match search +
+  create-new-feature), matching what's actually in the code now.
+  Left as-is / out of scope: the identical "assumes it's already in the
+  compendium" pattern also exists for class-page features (buildAdvancement
+  in scraper.mjs), but class pages don't have per-feature prose sections in
+  the same structural way subclass pages do — would need separate
+  investigation, not touched here. Also noticed "Level 3: Archfey Spells"
+  itself gets parsed as a (spurious) feature name pointing at the spell-list
+  section header, not a real grantable feature — pre-existing behavior,
+  unrelated to this fix, not touched; the new dialog just makes it equally
+  fixable/skippable like everything else in Problem Imports instead of a
+  silent dead end.
+
 - 2026-08-17 — session 1 — Implemented and verified the full plan in one pass:
   - Part 1 (scraper.mjs): added PROGRESSION_OVERRIDES = {artificer: "artificer"}
     applied after the heuristic in scrapeClass(); added TOOL_CODES (verified

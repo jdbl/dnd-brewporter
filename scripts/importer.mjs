@@ -1,5 +1,6 @@
-import { scrapeWikidotHtml, resolveSourceUrl, isWikidotPage, assembleSubclassItem, slugify } from "./scraper.mjs";
+import { scrapeWikidotHtml, resolveSourceUrl, isWikidotPage, assembleSubclassItem, slugify, normalizeName, searchIndex } from "./scraper.mjs";
 import { scrapeFreeformSubclass } from "./freeform-scraper.mjs";
+import { showBuildFeatureDialog } from "./effects-builder.mjs";
 
 // Below this many detected "Nth Level:" headings, a freeform parse is
 // shown for review before creating anything — a strong sign the doc
@@ -13,19 +14,6 @@ export const MODULE_ID = "dnd-brewporter";
 // yet (single-machine setups only — see the module's plan doc for the
 // remote/shared-Foundry follow-up).
 const PROXY_URL = "http://localhost:8091";
-
-// Strips the scraper's "FIXME: " / "FIXME spell: " prefix and any trailing
-// parenthetical qualifier the wiki adds but the compendium name doesn't have
-// (e.g. "Indomitable (One Use)" -> "Indomitable").
-function normalizeName(name) {
-  return String(name)
-    .replace(/^FIXME(\s+spell)?:\s*/i, "")
-    .trim()
-    .toLowerCase()
-    .replace(/\s*\([^)]*\)\s*$/, "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
 
 function packUuid(pack, id) {
   return `Compendium.${pack.metadata.packageName}.${pack.metadata.name}.${pack.documentName}.${id}`;
@@ -49,7 +37,7 @@ async function buildNameIndex() {
       const key = normalizeName(entry.name);
       const uuid = entry.uuid ?? packUuid(pack, entry._id);
       if (!index.has(key)) index.set(key, []);
-      index.get(key).push({ uuid, name: entry.name, pack: pack.collection, tier });
+      index.get(key).push({ uuid, name: entry.name, pack: pack.collection, tier, img: entry.img, type: entry.type });
     }
   }
   return index;
@@ -67,14 +55,14 @@ function lookup(index, rawName) {
   return { status: "ambiguous", candidates: pool };
 }
 
-// Ambiguous matches (multiple compendium items share a name) get queued
-// into `pending` instead of going straight to report.unresolved — the
-// caller attaches the created item's UUID once it exists, so the report
-// dialog can offer a "Choose…" picker that writes the pick straight back
-// into that field instead of sending the user to the item sheet. A "no
-// match at all" result has nothing to pick from, so it's still reported
-// directly as before.
-function resolveSlot(entry, hintKey, index, report, context, path, pending) {
+// Neither an ambiguous match (multiple compendium items share a name) nor
+// a total miss (no name in the index at all) can be fixed until the parent
+// item exists, so both get queued into `pending` — the caller attaches the
+// created item's UUID once it exists, so the review dialog can write a pick
+// straight back into that field instead of sending the user to the item
+// sheet by hand. Total misses still get `candidates: []`; the review UI
+// covers them with a live compendium search instead of a fixed list.
+function resolveSlot(entry, hintKey, index, report, context, path, pending, descByName) {
   if (!entry || typeof entry !== "object" || !(hintKey in entry)) return;
   const targetKey = "uuid" in entry ? "uuid" : typeof entry.key === "string" ? "key" : null;
   if (!targetKey || entry[targetKey] !== "") return;
@@ -89,10 +77,18 @@ function resolveSlot(entry, hintKey, index, report, context, path, pending) {
     pending.push({
       context, name: rawName, reason: `${result.candidates.length} matches (${packs})`,
       path: `${path}.${targetKey}`,
-      candidates: result.candidates.map((c) => ({ uuid: c.uuid, name: c.name, pack: c.pack })),
+      candidates: result.candidates.map((c) => ({ uuid: c.uuid, name: c.name, pack: c.pack, img: c.img, type: c.type })),
     });
   } else {
-    report.unresolved.push({ context, name: rawName, reason: "no match found" });
+    pending.push({
+      context, name: rawName, reason: "no match found",
+      path: `${path}.${targetKey}`,
+      candidates: [],
+      // Only populated for wikidot subclass features (see parseSubclassContent
+      // in scraper.mjs) — lets the review dialog offer "create a new feature"
+      // with the real scraped text instead of starting from a blank item.
+      descriptionHtml: descByName?.get(rawName) ?? null,
+    });
   }
   delete entry[hintKey];
 }
@@ -100,7 +96,7 @@ function resolveSlot(entry, hintKey, index, report, context, path, pending) {
 // Walks exactly the two shapes the scraper produces — it does not blindly
 // recurse the whole document, so it can't accidentally touch unrelated
 // fields.
-function resolveItemUuids(data, index, report, pending) {
+function resolveItemUuids(data, index, report, pending, featureDetails = []) {
   const contextBase = data.name ?? "(unnamed item)";
 
   (data.system?.startingEquipment ?? []).forEach((entry, i) => {
@@ -111,15 +107,16 @@ function resolveItemUuids(data, index, report, pending) {
     const items = adv.configuration?.items;
     if (!Array.isArray(items)) continue;
     const label = `${contextBase} — level ${adv.level ?? "?"} (${adv.title || adv.type})`;
+    const descByName = new Map(featureDetails.filter((f) => f.level === adv.level).map((f) => [f.name, f.descriptionHtml]));
     items.forEach((entry, i) => {
-      resolveSlot(entry, "_name", index, report, label, `system.advancement.${advKey}.configuration.items.${i}`, pending);
+      resolveSlot(entry, "_name", index, report, label, `system.advancement.${advKey}.configuration.items.${i}`, pending, descByName);
     });
   }
 }
 
-async function createItemFromData(data, label, index, report, via) {
+async function createItemFromData(data, label, index, report, via, featureDetails) {
   const pending = [];
-  resolveItemUuids(data, index, report, pending);
+  resolveItemUuids(data, index, report, pending, featureDetails);
   delete data._id;
   delete data.folder;
   try {
@@ -292,7 +289,8 @@ async function importFile(file, index, report) {
 
     const raw = await res.text();
     if (isWikidotPage(raw)) {
-      await createItemFromData(scrapeWikidotHtml(raw, file).item, label, index, report, "folder");
+      const scraped = scrapeWikidotHtml(raw, file);
+      await createItemFromData(scraped.item, label, index, report, "folder", scraped.featureDetails);
     } else {
       await handleFreeformResult(scrapeFreeformSubclass(raw, label), label, index, report, "folder");
     }
@@ -304,7 +302,8 @@ async function importFile(file, index, report) {
 async function importFetchedPage(html, url, index, report, via) {
   try {
     if (isWikidotPage(html)) {
-      await createItemFromData(scrapeWikidotHtml(html, url).item, url, index, report, via);
+      const scraped = scrapeWikidotHtml(html, url);
+      await createItemFromData(scraped.item, url, index, report, via, scraped.featureDetails);
     } else {
       await handleFreeformResult(scrapeFreeformSubclass(html, url), url, index, report, via);
     }
@@ -313,44 +312,182 @@ async function importFetchedPage(html, url, index, report, via) {
   }
 }
 
-// Small picker for one ambiguous field — resolves to the chosen uuid, or
-// null if the user cancels.
-function chooseUuidDialog(entry) {
-  return new Promise((resolve) => {
-    const options = entry.candidates.map((c) => `<option value="${c.uuid}">${c.name} — ${c.pack}</option>`).join("");
-    new Dialog({
-      title: `Choose match for "${entry.name}"`,
-      content: `
-        <form>
-          <div class="form-group">
-            <label>${entry.candidates.length} possible matches for <strong>${entry.name}</strong> (${entry.context}):</label>
-            <select name="uuid" style="width:100%;">${options}</select>
-          </div>
-        </form>
-      `,
-      buttons: {
-        ok: { label: "Apply", callback: (html) => resolve(html.find("[name=uuid]").val()) },
-        cancel: { label: "Cancel", callback: () => resolve(null) },
-      },
-      default: "ok",
-    }).render(true);
-  });
+const PROBLEM_DIALOG_STYLES = `
+  <style>
+    .wikidot-problem-row { border-bottom: 1px solid var(--color-border-light-tertiary, #999); padding: 8px 0; }
+    .wikidot-problem-row.wikidot-problem-resolved { opacity: 0.6; }
+    .wikidot-problem-header { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; }
+    .wikidot-problem-header em { color: var(--color-text-dark-secondary, #666); font-size: 0.9em; }
+    .wikidot-badge { font-size: 0.75em; padding: 1px 6px; border-radius: 3px; color: #fff; white-space: nowrap; }
+    .wikidot-badge-ambiguous { background: #b5762a; }
+    .wikidot-badge-none { background: #a33; }
+    .wikidot-badge-resolved { background: #2a7d3f; padding: 2px 8px; }
+    .wikidot-candidate { display: flex; align-items: center; gap: 6px; padding: 3px 4px; border-radius: 3px; }
+    .wikidot-candidate:hover { background: rgba(127,127,127,0.15); }
+    .wikidot-candidate img { border: none; flex: 0 0 auto; }
+    .wikidot-candidate-info { flex: 1; min-width: 0; }
+    .wikidot-candidate-name { font-weight: bold; }
+    .wikidot-candidate-meta { font-size: 0.85em; color: var(--color-text-dark-secondary, #666); }
+    .wikidot-candidate-detail-panel { margin: 2px 0 6px 42px; padding: 4px 8px; border-left: 2px solid #999; font-size: 0.9em; max-height: 200px; overflow-y: auto; }
+    .wikidot-search-input { width: 100%; margin-bottom: 4px; }
+    .wikidot-create-feature-row { display: flex; align-items: center; gap: 6px; margin-top: 6px; padding-top: 6px; border-top: 1px dashed var(--color-border-light-tertiary, #999); }
+    .wikidot-create-feature-row em { font-size: 0.85em; color: var(--color-text-dark-secondary, #666); }
+  </style>
+`;
+
+function candidateCardHtml(c) {
+  return `
+    <div class="wikidot-candidate">
+      <img src="${c.img || "icons/svg/mystery-man.svg"}" width="28" height="28">
+      <div class="wikidot-candidate-info">
+        <div class="wikidot-candidate-name">${c.name}</div>
+        <div class="wikidot-candidate-meta">${c.pack}${c.type ? ` · ${c.type}` : ""}</div>
+      </div>
+      <button type="button" class="wikidot-candidate-details" data-uuid="${c.uuid}">Details</button>
+      <button type="button" class="wikidot-candidate-use" data-uuid="${c.uuid}">Use this</button>
+    </div>
+    <div class="wikidot-candidate-detail-panel" data-uuid="${c.uuid}" style="display:none;"></div>
+  `;
 }
 
-function showReport(report) {
+async function applyResolution(entry, uuid, chosenName, rowEl) {
+  try {
+    const doc = await fromUuid(entry.itemUuid);
+    if (!doc) throw new Error("Created item no longer exists");
+    await doc.update({ [entry.path]: uuid });
+    rowEl.addClass("wikidot-problem-resolved");
+    rowEl.find(".wikidot-problem-candidates").html(
+      `<span class="wikidot-badge wikidot-badge-resolved">✓ Resolved to ${chosenName ?? uuid}</span>`
+    );
+  } catch (err) {
+    ui.notifications.error(`Could not apply choice for "${entry.name}": ${err.message ?? err}`);
+  }
+}
+
+// The dedicated review screen for report.unresolved — every row is either
+// "ambiguous" (multiple same-named compendium items to pick between, shown
+// with icon/type so near-duplicates across packs are easy to tell apart) or
+// "no match found" (nothing indexed under that name, so a live search box
+// over the same compendium index stands in for a fixed candidate list).
+function showProblemImportsDialog(report, index) {
+  const rowHtml = (entry, i) => `
+    <div class="wikidot-problem-row" data-problem-index="${i}">
+      <div class="wikidot-problem-header">
+        ${entry.candidates.length
+          ? `<span class="wikidot-badge wikidot-badge-ambiguous">${entry.candidates.length} matches</span>`
+          : `<span class="wikidot-badge wikidot-badge-none">No match</span>`}
+        <strong>${entry.name}</strong>
+        <em>${entry.context}</em>
+      </div>
+      <div class="wikidot-problem-candidates">
+        ${entry.candidates.length
+          ? entry.candidates.map(candidateCardHtml).join("")
+          : `<input type="text" class="wikidot-search-input" value="${entry.name}" placeholder="Search compendiums for a match…">
+             <div class="wikidot-search-results"></div>
+             <div class="wikidot-create-feature-row">
+               <button type="button" class="wikidot-create-feature">+ Create new Feature item</button>
+               <em>${entry.descriptionHtml
+                 ? "uses the description text scraped from the source page"
+                 : "no description text was found on the page — edit it after creating"}</em>
+             </div>`}
+      </div>
+    </div>
+  `;
+
+  const content = `
+    ${PROBLEM_DIALOG_STYLES}
+    <div class="wikidot-problem-list" style="max-height:65vh; overflow-y:auto;">
+      ${report.unresolved.length ? report.unresolved.map(rowHtml).join("") : "<p>Nothing left to fix.</p>"}
+    </div>
+  `;
+
+  new Dialog(
+    {
+      title: `Fix Problem Imports (${report.unresolved.length})`,
+      content,
+      buttons: { close: { label: "Close" } },
+      render: (html) => {
+        html.on("click", ".wikidot-candidate-details", async (ev) => {
+          const uuid = $(ev.currentTarget).data("uuid");
+          const panel = $(ev.currentTarget).closest(".wikidot-candidate").next(".wikidot-candidate-detail-panel");
+          if (panel.is(":visible")) return panel.slideUp(100);
+          if (!panel.data("loaded")) {
+            panel.show().html("Loading…");
+            const doc = await fromUuid(uuid);
+            const desc = doc?.system?.description?.value || "<em>No description available.</em>";
+            panel.data("loaded", true).html(desc);
+          } else {
+            panel.slideDown(100);
+          }
+        });
+
+        html.on("click", ".wikidot-candidate-use", async (ev) => {
+          const rowEl = $(ev.currentTarget).closest(".wikidot-problem-row");
+          const idx = Number(rowEl.data("problem-index"));
+          const uuid = $(ev.currentTarget).data("uuid");
+          const chosenName = $(ev.currentTarget).closest(".wikidot-candidate").find(".wikidot-candidate-name").text();
+          await applyResolution(report.unresolved[idx], uuid, chosenName, rowEl);
+        });
+
+        html.on("click", ".wikidot-create-feature", async (ev) => {
+          const rowEl = $(ev.currentTarget).closest(".wikidot-problem-row");
+          const idx = Number(rowEl.data("problem-index"));
+          const entry = report.unresolved[idx];
+          const chosenName = (rowEl.find(".wikidot-search-input").val() || entry.name || "").trim();
+          if (!chosenName) return ui.notifications.warn("Enter a name for the new feature first.");
+          try {
+            const parentDoc = await fromUuid(entry.itemUuid);
+            if (!parentDoc) throw new Error("Created item no longer exists");
+            const advId = entry.path.match(/^system\.advancement\.([^.]+)\./)?.[1];
+            const level = advId ? (parentDoc.system.advancement[advId]?.level ?? 0) : 0;
+
+            const built = await showBuildFeatureDialog({ name: chosenName, index });
+            if (built === null) return; // cancelled from the effects/activities step
+
+            const data = buildFeatureItemData({ name: chosenName, level, descriptionHtml: entry.descriptionHtml || "" }, parentDoc.name);
+            if (built.effects.length) data.effects = built.effects;
+            if (Object.keys(built.activities).length) data.system.activities = built.activities;
+
+            const created = await Item.create(data);
+            // Foundry can reject a document's data (e.g. a malformed
+            // attached Activity) without the create() promise itself
+            // rejecting — it logs a DataModelValidationError via its own
+            // error hook and resolves with nothing instead. Surface that
+            // clearly rather than crashing on created.name below.
+            if (!created) throw new Error("Foundry rejected the item's data (check the browser console for a DataModelValidationError — likely from an attached effect or activity).");
+            report.created.push({ name: created.name, uuid: created.uuid, file: entry.context, via: "created-on-review" });
+            await applyResolution(entry, created.uuid, created.name, rowEl);
+          } catch (err) {
+            ui.notifications.error(`Could not create feature "${entry.name}": ${err.message ?? err}`);
+          }
+        });
+
+        html.on("input", ".wikidot-search-input", (ev) => {
+          const input = $(ev.currentTarget);
+          const resultsEl = input.siblings(".wikidot-search-results");
+          const matches = searchIndex(index, input.val());
+          resultsEl.html(matches.length ? matches.map(candidateCardHtml).join("") : "<p><em>No matches.</em></p>");
+        });
+        html.find(".wikidot-search-input").trigger("input");
+      },
+    },
+    { width: 640, resizable: true }
+  ).render(true);
+}
+
+function showReport(report, index) {
   const section = (title, rows) =>
     rows.length ? `<h3>${title} (${rows.length})</h3><ul>${rows.map((r) => `<li>${r}</li>`).join("")}</ul>` : "";
-
-  const unresolvedRow = (r, i) =>
-    `<li data-unresolved-index="${i}"><strong>${r.name}</strong> <em>(${r.context})</em> — ${r.reason}` +
-    (r.candidates?.length ? ` <button type="button" class="wikidot-choose-uuid" data-index="${i}">Choose…</button>` : "") +
-    `</li>`;
 
   const content = `
     <div style="max-height:60vh; overflow-y:auto;">
       ${section("Created", report.created.map((c) => `<strong>${c.name}</strong> — <code>${c.uuid}</code> (${c.file}${c.via ? `, via ${c.via}` : ""})`))}
       ${section("Resolved UUIDs", report.resolved.map((r) => `${r.name} → ${r.pack}`))}
-      ${report.unresolved.length ? `<h3>Unresolved — needs a manual fix in the item sheet (${report.unresolved.length})</h3><ul>${report.unresolved.map(unresolvedRow).join("")}</ul>` : ""}
+      ${report.unresolved.length
+        ? `<h3>Problem Imports (${report.unresolved.length})</h3>
+           <p>${report.unresolved.length} field(s) need a manual match — ambiguous names or no compendium match found.</p>
+           <button type="button" class="wikidot-review-problems">Review &amp; Fix…</button>`
+        : ""}
       ${section(
         "Couldn't fetch at all (CORS blocked it, and the local proxy wasn't reachable) — save these pages locally and re-run",
         report.manualSaveNeeded.map((u) => `<a href="${u}" target="_blank" rel="noopener">${u}</a>`)
@@ -364,25 +501,9 @@ function showReport(report) {
     content,
     buttons: { ok: { label: "Close" } },
     render: (html) => {
-      html.on("click", ".wikidot-choose-uuid", async (ev) => {
-        const idx = Number($(ev.currentTarget).data("index"));
-        const entry = report.unresolved[idx];
-        const chosenUuid = await chooseUuidDialog(entry);
-        if (!chosenUuid) return;
-        try {
-          const doc = await fromUuid(entry.itemUuid);
-          if (!doc) throw new Error("Created item no longer exists");
-          await doc.update({ [entry.path]: chosenUuid });
-          const chosen = entry.candidates.find((c) => c.uuid === chosenUuid);
-          html.find(`li[data-unresolved-index="${idx}"]`).html(
-            `<strong>${entry.name}</strong> <em>(${entry.context})</em> — ✓ resolved to ${chosen?.name ?? chosenUuid}`
-          );
-        } catch (err) {
-          ui.notifications.error(`Could not apply choice for "${entry.name}": ${err.message ?? err}`);
-        }
-      });
+      html.on("click", ".wikidot-review-problems", () => showProblemImportsDialog(report, index));
     },
-  }).render(true);
+  }, { width: 520, resizable: true }).render(true);
 
   console.log(`${MODULE_ID} | Import report`, report);
 }
@@ -475,7 +596,7 @@ async function startImport(urlsText, folderPath) {
   for (const r of fetchedOk) await importFetchedPage(r.html, r.url, index, report, r.via);
   for (const file of files) await importFile(file, index, report);
 
-  showReport(report);
+  showReport(report, index);
 }
 
 export async function runImport() {
@@ -533,7 +654,7 @@ export async function runImport() {
       cancel: { label: "Cancel" },
     },
     default: "run",
-  }).render(true);
+  }, { width: 520, resizable: true }).render(true);
 }
 
 // Convenience for macros/console use that want to skip the dialog.
