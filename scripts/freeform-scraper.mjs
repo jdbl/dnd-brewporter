@@ -79,6 +79,7 @@ export function scrapeFreeformSubclass(html, sourceLabel) {
 
   let name = null;
   let classIdentifier = null;
+  let className = null;
   let titleResolved = false;
   const titleCandidateLines = []; // substantial lines seen so far, before the title is resolved
   const spellGrants = [];
@@ -126,6 +127,7 @@ export function scrapeFreeformSubclass(html, sourceLabel) {
           // whichever candidate line was buffered most recently, not
           // necessarily the very first line seen.
           classIdentifier = slugify(taglineMatch[1]);
+          className = taglineMatch[1];
           name = titleCandidateLines.at(-1) ?? null;
           titleResolved = true;
           if (!headingMatch) continue;
@@ -161,5 +163,5 @@ export function scrapeFreeformSubclass(html, sourceLabel) {
   const descriptionHtml = nonEmptyBlocksHtml(preambleEls);
   const featureDetails = features.map((f) => ({ level: f.level, name: f.name, descriptionHtml: nonEmptyBlocksHtml(f.descBlocks) }));
 
-  return { name, classIdentifier, featuresByLevel, spellGrants, scaleColumns: {}, confidence, descriptionHtml, featureDetails };
+  return { name, classIdentifier, className, featuresByLevel, spellGrants, scaleColumns: {}, confidence, descriptionHtml, featureDetails };
 }

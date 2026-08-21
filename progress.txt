@@ -24,6 +24,518 @@ credentials.
 ## Notes / decisions log
 (most recent first — one entry per session, include date + what changed/was learned)
 
+- 2026-08-20 — session 15 — User tried session 14's folder feature live and
+  reported the actual bug it was hiding: a new "Subclass Features" folder
+  (and implicitly, potentially a new class folder too) got created for
+  EACH feature instead of every feature reusing the same one. Root cause:
+  resolveFolderPath()'s reuse check compared a Folder document's own
+  `.folder` (its parent) directly against a plain id string
+  (`f.folder === parentId`) — but on a real Foundry client, a Folder's
+  `.folder` getter resolves to the actual parent Folder DOCUMENT, not the
+  raw id, so that comparison could never be true and every call fell
+  through to creating a new folder. The session 14 scratchpad test hadn't
+  caught this because its Folder mock stored `.folder` as the plain id it
+  was given, not a resolved object — an inaccurate mock that happened to
+  match the buggy code's assumption instead of the real API. Fixed with a
+  small folderParentId() normalizer (`folder.folder?.id ?? folder.folder ??
+  null`) so the comparison works whether `.folder` is a resolved Document
+  or a raw id. Re-verified with the SAME scratchpad test from session 14,
+  first fixing the Folder mock itself to actually resolve `.folder` to the
+  parent object (replicating the real behavior that exposed this) — confirmed
+  the old code would now fail this more accurate mock and the fix passes
+  it: re-running the two-import sequence (wikidot Archfey Patron, then a
+  synthetic freeform Warlock subclass) still produces exactly one "Warlock"
+  and one "Subclass Features" folder, both reused across both imports.
+  Second ask: rebrand user-visible "Wikidot" strings to "Brewporter" (the
+  module's actual name) — the module now also handles Google Docs/freeform
+  sources, so "Wikidot" in the UI undersells/misdescribes what it does.
+  Scoped to strings a user actually sees (dialog titles, button/macro
+  labels, settings names, ui.notifications text) — left internal-only
+  identifiers alone (scrapeWikidotHtml(), isWikidotPage(),
+  resolveWikidotUrl(), the .wikidot-* CSS class names throughout
+  importer.mjs/effects-builder.mjs) since renaming those touches nothing
+  the user sees and risks breaking an event-handler selector for no
+  visible benefit — the user asked for "the UI and button text," not an
+  internal rename.
+  - main.mjs: "Wikidot Import Folder" setting -> "Brewporter Import
+    Folder"; the auto-created macro "Import Wikidot Items" -> "Import
+    Brewporter Items" (also updated the notification that echoes the
+    macro's name and the sidebar button's own label/fallback-warning
+    text, so they still match the renamed macro).
+  - importer.mjs: "Wikidot Import"/"Wikidot Import Report" dialog titles ->
+    "Brewporter Import"/"Brewporter Import Report"; "Wikidot D&D Importer"
+    (the main entry dialog) -> "D&D Brewporter Importer" (reordered rather
+    than a literal word-swap, since "Brewporter D&D Importer" read
+    backwards); the "Wikidot Importer | Indexing compendiums..." notification
+    -> "Brewporter | Indexing compendiums...".
+  README's step-2 usage instructions updated to match the renamed macro/
+  button text.
+  node --check on both touched files passes; re-ran the folder e2e
+  scratchpad test (see above) to confirm the rename didn't touch anything
+  the tests exercise. Not verified live in a running Foundry client.
+
+- 2026-08-20 — session 14 — Two related asks: (1) "remove direct references
+  to the old wikidot name" and (2) file created items into Foundry Item
+  folders matching the layout of the official compendiums — for
+  http://dnd2024.wikidot.com/warlock:archfey-patron, that's "Warlock" for
+  the subclass item itself and "Warlock/Subclass Features" for everything
+  generated under it.
+  - Found the concrete "old wikidot name" reference: scrapeSubclass()'s
+    `fallbackClassSlug`, built by chopping up the raw source URL
+    (`sourceUrl.split(":").pop().split("/").pop()`) as a last-resort
+    classIdentifier when breadcrumb parsing failed. Worse than just
+    unnecessary — demonstrably wrong if it ever fired, since for a
+    *subclass* URL like ".../warlock:archfey-patron" the text after the
+    LAST colon is the subclass's own slug ("archfey-patron"), not the
+    class's ("warlock"); it would have mislabeled the class identifier had
+    it ever actually triggered. Removed entirely — deriveClassIdentifierFromBreadcrumb()
+    (renamed deriveClassFromBreadcrumb(), no fallbackSlug parameter) now
+    throws a clear error via scrapeSubclass() if breadcrumb parsing fails,
+    rather than silently guessing from the URL. As a side effect,
+    `sourceUrl` became fully unused in scrapeSubclass()/scrapeWikidotHtml()
+    — dropped from both signatures (and their call sites in importer.mjs)
+    rather than left as a dead parameter.
+  - That same breadcrumb-parsing function already had the *identifier*
+    ("warlock") but not the class's clean display text ("Warlock") needed
+    for a folder name — it now returns both `{identifier, name}` (the
+    breadcrumb link's own text content for `name`, no separate lookup).
+    assembleSubclassItem() (shared by both the wikidot and freeform paths)
+    gained a `className` param, threaded into its return value alongside
+    `item`. freeform-scraper.mjs's tagline match ("A Warlock Subclass")
+    already captured the class word for classIdentifier — reused the same
+    captured text (pre-slugify, so still properly cased) as `className`
+    rather than re-deriving it.
+  - importer.mjs: new resolveFolderPath(segments) helper — finds-or-creates
+    a nested Item folder path via Folder.create(), matching by name+parent
+    in game.folders first so repeated imports reuse the same folders
+    instead of duplicating them (verified directly — see below). Wired in
+    at the three places an Item actually gets created:
+    1. createItemFromData() (the shared top-level item creator, used for
+       both wikidot and freeform subclass imports) now takes a `className`
+       param and sets `data.folder = className ? await
+       resolveFolderPath([className]) : null` instead of unconditionally
+       deleting the field. A plain class-page import (no className
+       produced by scrapeClass()) is unaffected — stays unfiled, since
+       nothing was specified for that case and there's no obvious
+       "features" bucket to mirror for it the way there is for a subclass.
+    2. handleFreeformResult()'s per-feature Item.create() (freeform
+       auto-generated features) now sets `.folder` to
+       resolveFolderPath([result.className, "Subclass Features"]),
+       resolved once outside the per-feature loop.
+    3. The wikidot "+ Create new Feature item" handler (Problem Imports
+       dialog, showProblemImportsDialog()) — deliberately does NOT
+       re-derive the class name here; instead reads it straight off the
+       already-created parent subclass item's own `.folder.name` (that
+       item was filed under its class folder by createItemFromData() when
+       IT was created, earlier in the same import), so there's exactly one
+       place className ever gets sourced from breadcrumb/tagline text, not
+       two independent derivations that could drift.
+  Verified two ways against the real fetched archfey-patron page: (a) a
+  jsdom scratchpad test confirmed scrapeWikidotHtml(html) (no sourceUrl arg
+  now) returns className "Warlock" / classIdentifier "warlock"; (b) a
+  fuller scratchpad test with Folder/Item/FilePicker/Dialog.confirm mocked
+  drove the real importFromFolder() end-to-end (no Dialog-click-through
+  needed since folder-import skips the interactive review for a clean
+  parse) — confirmed the created "Archfey Patron" subclass item's `.folder`
+  is a real Folder named "Warlock" with no parent. Extended that same
+  script with a second, synthetic freeform "Testing Patron" (Warlock)
+  doc imported in the SAME game/folders state afterward: confirmed its two
+  auto-generated features both land in a "Subclass Features" folder nested
+  under the SAME "Warlock" folder object from the first import (only one
+  "Warlock" folder exists across both — resolveFolderPath()'s reuse-by-
+  name-and-parent works as intended) and the subclass item itself lands in
+  that same "Warlock" folder alongside "Archfey Patron". Did not
+  separately drive the wikidot "+ Create new Feature item" button's own
+  Dialog-nested click handler (would need the fuller Dialog-with-real-
+  buttons mock prior sessions built for effects-builder-test.mjs) — judged
+  low-risk since it calls the exact same resolveFolderPath() helper already
+  verified via the freeform path, just sourcing the class name from
+  `parentDoc.folder.name` instead of `result.className`; re-ran the earlier
+  full-page mechanics scan (guessFeatureMechanics over every featureDetails
+  segment) to confirm nothing about session 13's statusHints work
+  regressed. node --check on all four touched files passes. Not verified
+  live in a running Foundry client (V4, same outstanding item as every
+  prior session).
+  README gained a "Created items are filed into folders, not dropped
+  loose" section (explicitly distinguished from the pre-existing "Import
+  folder" disk-folder concept, since the two are easy to conflate by name).
+
+- 2026-08-20 — session 13 — User reported, again against
+  http://dnd2024.wikidot.com/warlock:archfey-patron, that importing left
+  "Disappearing Step" (Level 6, under Misty Escape — "You have the
+  Invisible condition until the start of your next turn or until
+  immediately after you make an attack roll, deal damage, or cast a
+  spell.") missing, and its Invisible effect "of course" missing too.
+  Traced it live: fetched the real page, confirmed parseSubclassContent()
+  already folds Disappearing Step's bolded paragraph into "Misty Escape"'s
+  featureDetails prose correctly (not a scraping bug), and the user's own
+  screenshot of the Build Feature dialog for Misty Escape showed 2
+  auto-guessed items (a Cast activity, a Save activity for "Dreadful
+  Step") but nothing for Disappearing Step at all — confirmed root cause:
+  session 11/12's effect-hint scanner only ever detects condition
+  *immunity* ("immune to the X condition"), never a feature *granting* a
+  condition to its own user ("you have the X condition"). Two completely
+  different Foundry shapes: immunity is a system.traits.ci.value change;
+  granting a status is the ActiveEffect's own `statuses` array, unrelated
+  to `changes` and (unlike the AC/resistance/speed/darkvision effect
+  guesses) not dependent on the DAE module at all — it's core Foundry.
+  - scraper.mjs: scanSegmentText() gained a second, independent condition
+    scan — skipped when the segment reads as immunity language (so "immune
+    to the X condition" isn't double-counted as also self-granting X) —
+    matching "have/has/gain/gains/gaining/are/become/becomes the <Condition>
+    condition" against the existing CONDITION_WORDS list (now exported,
+    reused by effects-builder.mjs below). Returned as a new `statusHints`
+    array alongside the existing `effectHints`, threaded through
+    guessFeatureMechanics() per-segment same as everything else.
+  - effects-builder.mjs: guessQueueEntries() now queues an Effect whenever
+    a segment has statusHints, unconditionally (no DAE gate) — combined
+    into the same Effect as that segment's DAE-gated `changes` when both
+    are present, rather than two separate queue rows under one label.
+    buildActiveEffectData() actually honors `form.statuses` now (was
+    hardcoded to `[]` — statuses had no path in at all before this
+    session, guessed or manual). activeEffectDataToPrefill() also carries
+    over `ae.statuses` — Copy-from-Compendium was silently dropping
+    statuses off a copied effect before this fix. Manual **+ New Effect**
+    form (activeEffectFormHtml/parseActiveEffectForm) gained a "Conditions
+    to apply" checkbox row so a status can be added by hand too, not just
+    via auto-guess or copy — options come from CONFIG.DND5E.conditionTypes
+    live in Foundry, falling back to CONDITION_WORDS outside it (matches
+    the same abilityOptions/damageTypeOptions pattern already in the
+    file). Also noticed and fixed two small pre-existing rough edges while
+    in this code: the change-key suggestion datalist was missing
+    system.traits.ci.value (di/dr/dv were there, ci wasn't); the Cast
+    activity's spell search and Copy-from-Compendium's search were both
+    still calling searchIndex() without the ruleset-preference argument
+    (default "2024" always, ignoring the user's actual setting) — both now
+    pass rulesetPreference().
+  Verified with a jsdom scratchpad test against the real fetched archfey-
+  patron page (curled live, same as prior sessions): scrapeWikidotHtml()'s
+  featureDetails already contained Disappearing Step's text inside "Misty
+  Escape" as expected; guessFeatureMechanics() on that descriptionHtml now
+  returns segment "Disappearing Step" -> statusHints: ["invisible"] (empty
+  before this session); re-scanned every segment across the whole page and
+  confirmed no regression — "Beguiling Defenses" still classifies as
+  effectHints (ci.value=charmed), not statusHints, since it hits the
+  immune-guard as before. buildActiveEffectData() confirmed to emit
+  `statuses: ["invisible"]` when passed. node --check on both changed
+  files passes. Not verified live in a running Foundry client (V4,
+  same outstanding item as every prior session — no GM credentials).
+  README's DAE/effects section gained a bullet clarifying this detector
+  runs regardless of DAE, and the "+ New Effect" bullet now mentions the
+  Conditions checklist.
+
+- 2026-08-20 — session 12 — User pointed at
+  http://dnd2024.wikidot.com/warlock:archfey-patron again, this time
+  wanting "Beguiling Darkness" (actual name, confirmed by fetching the live
+  page: "Beguiling Defenses", Level 10 — "You are immune to the Charmed
+  condition.") to auto-guess a condition-immunity effect, generalized to
+  "other similar features" — a real gap in session 11's effect-guesser,
+  which only handled damage-type resistance/immunity/vulnerability
+  (system.traits.{dr,di,dv}), not condition immunity (system.traits.ci).
+  - scraper.mjs: added CONDITION_WORDS (the 15 dnd5e condition-trait keys —
+    blinded, charmed, deafened, exhaustion, frightened, grappled,
+    incapacitated, invisible, paralyzed, petrified, poisoned, prone,
+    restrained, stunned, unconscious; none overlap a DAMAGE_TYPE_WORDS
+    entry, so the two detectors can't cross-fire). Two condition-immunity
+    patterns in scanSegmentText(), not one combined regex: (a) 2024 phrasing
+    ("the <Condition> condition") is scanned whenever the segment mentions
+    "immune"/"immunity" ANYWHERE in it, not requiring direct adjacency —
+    needed because canonical dnd5e phrasing often shares one "immune"
+    across a list, e.g. "immune to poison damage and the Poisoned
+    condition" (confirmed via a real failing test before this fix — an
+    adjacency-anchored single regex only ever caught the first item in
+    that kind of list); (b) 2014 phrasing ("immune to being <Condition>")
+    has no "condition" keyword to anchor on so that one does still require
+    direct adjacency to "immune". Both checked against CONDITION_WORDS
+    before becoming a system.traits.ci.value (Add) hint. Also added a
+    dedupe pass (by key+value) at the end of scanSegmentText() before
+    returning effectHints, since two independent detectors landing on the
+    identical change is now a real (if rare) possibility this session
+    introduced — belt-and-suspenders, not something the current patterns
+    are individually likely to trigger on their own.
+  - effects-builder.mjs: added "system.traits.ci.value" to the manual
+    Effect editor's change-key suggestion datalist for consistency with
+    the existing dr/di/dv entries (a small manual-editing improvement
+    alongside the auto-guess work, not user-requested but the same list
+    that's already there for those three).
+  README's DAE bullet extended to mention condition immunity, using
+  Beguiling Defenses as the concrete documented example, plus the
+  Charmed/frightened/poisoned/stunned generalization callout.
+  Verified: extended scratchpad/moduletest/dae-effect-guess-test.mjs
+  (Node/npm confirmed working again this session — same nvm-not-on-PATH
+  situation as session 11, resolved the same way) with the REAL Beguiling
+  Defenses text fetched live this session (confirms system.traits.ci.value
+  = "charmed", exactly 1 change on the effect — no false positives from the
+  feature's second paragraph, which has its own Wisdom-save-vs-spell-DC
+  reaction correctly guessed alongside it in the same unlabeled segment),
+  a 2014-phrasing ("immune to being Charmed") case, and the
+  poison-damage-plus-Poisoned-condition shared-immune case that caught the
+  adjacency bug during development (now captures both: di.value=poison AND
+  ci.value=poisoned, no duplicates) — 10 new checks, 28 total in that file,
+  all passing. Re-ran build-feature-guess-test.mjs (23 checks) and
+  ruleset-preference-test.mjs (31 checks) — both still pass unchanged, no
+  regression from this session's changes.
+  Known false-positive risk, documented here (not yet in README — narrower
+  than the other documented gaps, judged not worth the reader's attention
+  there): because pattern (a) above scans for "<word> condition" anywhere
+  in a segment that mentions "immune"/"immunity" at all rather than
+  requiring adjacency, a segment that separately discusses some OTHER
+  condition by name (e.g. "...while the Frightened condition persists...")
+  in the same block as an unrelated immunity to something else would
+  incorrectly also guess a Frightened immunity. Judged an acceptable
+  trade-off (same "starting point for review" philosophy as every other
+  guess here — always a normal, editable/removable queue row) given how
+  rare that specific combination is in practice, but worth tightening
+  (e.g. requiring the immune mention and the condition mention to be in the
+  same sentence/clause rather than the same block) if it turns out to
+  misfire on real content.
+  Still NOT verified live in an actual Foundry client with DAE installed
+  (same outstanding item as session 11).
+
+- 2026-08-20 — session 11 — User asked to detect the DAE module ("Dynamic
+  Effects using Active Effects", module id "dae") and, when it's active,
+  attempt to auto-build ActiveEffects for newly created features — a
+  natural extension of session 9/10's activity auto-guesser (which never
+  touched effects, only activities). Clarified scope with the user first
+  (two AskUserQuestion prompts): confirmed "dae" is the right module, and
+  confirmed the desired behavior is "extend the existing guess queue" (same
+  review-before-create pattern as activities), not fully-automatic
+  attachment or detection-only.
+  - scraper.mjs: scanSegmentText() (already returning usesFormula/
+    recoveryPeriod/savingThrow/diceHints per segment) now also returns
+    effectHints — a plain array of {key, mode, value} triples, the exact
+    shape buildActiveEffectData() already consumes for its `changes` list,
+    so no translation layer was needed. Four conservative regex detectors,
+    same "starting point for review" philosophy as the existing dice/save
+    detectors: "+X bonus to your AC" / "AC increases by X" ->
+    system.attributes.ac.bonus (Add); "resistance/immunity/vulnerability to
+    <type> damage" (type checked against the existing DAMAGE_TYPE_WORDS
+    list to avoid false positives) -> system.traits.{dr,di,dv}.value (Add);
+    "<walking/climbing/swimming/flying/burrowing> speed increases by X
+    feet" -> system.attributes.movement.<key> (Add); "darkvision ... X
+    feet" -> system.attributes.senses.darkvision (Upgrade, so it only wins
+    if greater than whatever's already there). Known gap, documented in
+    README: a damage-type list phrased as "resistance to bludgeoning,
+    piercing, and slashing damage" isn't picked up (the regex only matches
+    a single type-word immediately before "damage") — acceptable given the
+    existing bar for this scanner, but worth widening later if it turns out
+    to be a common real-world phrasing.
+  - effects-builder.mjs: new isDaeActive() checks
+    game.modules?.get("dae")?.active. guessQueueEntries() (renamed
+    conceptually — same function) now takes a featureName param and, per
+    segment, builds an Effect queue entry via buildActiveEffectData() when
+    seg.effectHints is non-empty AND isDaeActive() — named after the
+    segment's own bold sub-label if it has one, else the feature name,
+    else "Effect"; transfer: true, permanent duration (same defaults the
+    manual "+ New Effect" editor starts from). When DAE is NOT active,
+    hints are counted instead of dropped silently — new effectHintsSkipped
+    return value. Changed guessQueueEntries()'s return shape from a bare
+    array to { entries, effectHintsSkipped } (queue destructured as
+    `entries` in showBuildFeatureDialog, still the same mutable array
+    pushed/spliced elsewhere in that function — no behavior change to the
+    existing push/splice call sites).
+  - showBuildFeatureDialog(): when effectHintsSkipped > 0, a new note tells
+    the user how many effects were detected but not added and why (DAE not
+    active), with a pointer to + New Effect as the manual fallback — so DAE
+    absence is visible/explained rather than silently changing behavior.
+  README's "Attaching effects and activities" section documents the new
+  DAE-gated bullet, the four detected patterns, and the comma-list known
+  gap.
+  Node/npm turned out to be available after all (via nvm — just not on
+  PATH at the start of the session; a mid-session recheck found it). Wrote
+  scratchpad/moduletest/dae-effect-guess-test.mjs (18 checks, same jsdom
+  harness pattern as the existing tests, with game.modules.get mocked):
+  DAE active queues exactly 1 effect from a fixture combining all 4
+  patterns (AC bonus, cold resistance, walking speed, darkvision) in one
+  bold-labeled sub-option, confirms it's named after that label
+  ("Warded Skin"), transfer:true, permanent duration, and all 4 changes
+  present with correct key/mode/value; DAE inactive skips the effect and
+  shows the "N additional effect(s)...isn't active" note instead; DAE
+  module entirely absent (game.modules.get returns undefined) behaves the
+  same as inactive; text with no effect-shaped language produces no note
+  and no effect regardless of DAE state. Re-ran the two pre-existing
+  suites this touches (build-feature-guess-test.mjs: 23 checks,
+  ruleset-preference-test.mjs: 31 checks) — both still pass unchanged,
+  confirming the guessQueueEntries() return-shape change (bare array ->
+  { entries, effectHintsSkipped }) didn't regress the activity-guessing
+  path.
+  Still NOT verified live in an actual Foundry client with DAE installed —
+  per session 8's lesson, schema-shape bugs in what gets handed to
+  Item.create()/ActiveEffect only reliably surface there, so that's still
+  worth a real V4-style check next.
+
+- 2026-08-20 — session 10 — Two follow-ups to session 9's ruleset toggle and
+  auto-guess feature, both from the same "Steps of the Fey" example:
+  1. "Toggle to choose between player or monster spells or features... if
+     toggle is on for players then no monster options should be chosen if
+     names match" — a second, independent axis of the same "wrong-edition
+     content getting offered" problem session 9 fixed for 2024-vs-5e:
+     monster-only content (dnd5e's own `monsterfeatures`/`monsterfeatures24`
+     packs) sits in the exact same shared Item name-index as player content,
+     so a monster feature that happens to share a name with a player class
+     feature could get offered as a search result/ambiguous candidate, or
+     even silently auto-resolved if it were the only match. Unlike the
+     ruleset case, the user wants a hard exclude here, not a tie-break — "no
+     monster options should be chosen" — so this is filtered at the source
+     instead of at each lookup call site: new setting "contentType"
+     (main.mjs: player/monster, default "player") is read once in
+     buildNameIndex() (importer.mjs), which now only calls getIndex() on
+     packs classified as the matching kind via a new packContentKind()
+     helper (pack name matches /monster/i -> "monster", else "player") —
+     the other kind's packs are never even indexed, so every downstream
+     consumer (lookup(), searchIndex(), Cast/Copy-from-Compendium search,
+     the ambiguous/no-match dialog) automatically respects it with no extra
+     plumbing, and the excluded kind genuinely cannot show up anywhere, not
+     just deprioritized. Exported packContentKind() and buildNameIndex()
+     (both were previously private) specifically so they could be unit/
+     integration-tested directly, matching this module's established
+     pattern of exporting pure helpers for testability (session 6's
+     normalizeName()/searchIndex() move to scraper.mjs was the precedent).
+  2. "I also want to keep the names of the subfeatures like refreshing
+     step" — session 9's guessFeatureMechanics() flattened an entire
+     feature's text into one blob before scanning it, so a named sub-option
+     bolded inline (wikidot's own convention — "<strong>Refreshing
+     Step.</strong> Immediately after you teleport...") lost its name
+     entirely; the guessed Heal/Save activities came out unnamed even
+     though the source text clearly labeled them. Restructured
+     guessFeatureMechanics() (scraper.mjs) to split the prose into segments
+     at each block-level element: a block whose first meaningful content is
+     a <strong>/<b> tag (leadingBoldLabel()) starts a new segment carrying
+     that label (trailing period stripped), anything else extends the
+     current (possibly unlabeled) segment. Every detector (spell links,
+     ability-modifier formula, rest recovery, saving throw, dice) now runs
+     per-segment via a new scanSegmentText() helper instead of once over
+     the whole flattened text, so each sub-option's own mechanics stay
+     attached to its own name. Return shape changed from one flat hints
+     object to `{ segments: [...] }` (each with its own label/spellNames/
+     usesFormula/recoveryPeriod/savingThrow/diceHints) — updated
+     guessQueueEntries() (effects-builder.mjs) to iterate segments and pass
+     `name: seg.label ?? ""` into every buildActivityData() call, so a
+     guessed activity now literally shows up as e.g. "Activity (Heal):
+     Refreshing Step" in the queue instead of "(unnamed)". The main/
+     unlabeled segment (the feature's own top-level text, e.g. Steps of the
+     Fey's opening "you can cast Misty Step...") still guesses fine and
+     just gets a blank name, same as before this session.
+  Verified: extended scratchpad/moduletest/ruleset-preference-test.mjs (31
+  checks total now) — confirms guessFeatureMechanics() on the real Steps of
+  the Fey text now returns exactly 3 segments (unlabeled main + "Refreshing
+  Step" + "Taunting Step") with the right hints attributed to each, plus 4
+  new checks for packContentKind()/buildNameIndex() (classifies
+  "monsterfeatures"/"monsterfeatures24" as monster and "classfeatures24"/
+  "spells24" as player; a name collision between a player pack and a
+  monster pack resolves to ONLY the matching-kind entry under each
+  contentType setting, confirming the other kind's entry is excluded
+  outright, not just deprioritized). Extended
+  scratchpad/moduletest/build-feature-guess-test.mjs (23 checks) — full
+  showBuildFeatureDialog() run against the real text now confirms the Cast
+  activity's name is blank while the Save and Heal activities carry
+  "Taunting Step" and "Refreshing Step" respectively, and that the queue
+  rows visibly show both names. Re-ran the two surviving pre-session-9
+  integration tests (effects-builder-test.mjs, archfey-nomatch-test.mjs,
+  both needed a `contentType: "player"` entry added to their game.settings
+  mock alongside the rulesetPreference one from last session) — both still
+  pass with byte-identical output to before this session's changes (the
+  Beguiling Defenses fixture text has no bold sub-labels, so it still comes
+  out as one unlabeled segment — confirms the segment split is a strict
+  generalization of the old single-blob behavior, not a change to it, when
+  there's nothing to split on).
+  README updated: "Matching rules" documents the new contentType setting;
+  the auto-guess section's Steps-of-the-Fey walkthrough now shows the
+  Refreshing Step/Taunting Step names carrying through, with a short note
+  on the bold-lead-in convention that triggers it.
+
+- 2026-08-20 — session 9 — User pointed at
+  http://dnd2024.wikidot.com/warlock:archfey-patron again and asked for two
+  robustness improvements to importing, both scoped from real friction seen
+  building "Steps of the Fey" in sessions 7/8:
+  1. "It asks between 2024 and 5e for Misty Step/Sleep every time" — traced
+     to two different code paths having two different (and inconsistent)
+     answers to the same duplicate-name problem. resolveItemUuids()'s
+     lookup() (importer.mjs) already silently, unconditionally preferred a
+     tier-1 ("...24"-suffixed) pack when present — never asked at all, no
+     way to get 2014/5e instead. But searchIndex() (scraper.mjs) — used by
+     the Cast activity's spell search and Copy-from-Compendium, i.e.
+     exactly the path used to pick Misty Step for Steps of the Fey — applied
+     NO filtering at all, always listing both editions' entries for every
+     search, forcing a manual pick every single time with nothing
+     remembered. Unified both under one new setting,
+     "rulesetPreference" (main.mjs: choices 2024/5e/ask, default "2024" to
+     match the old lookup() behavior exactly, so nothing regresses for
+     anyone who doesn't touch it) and one new pure helper,
+     applyRulesetPreference() (scraper.mjs) — collapses a candidate list to
+     just the preferred tier when both tiers are actually present, otherwise
+     leaves it untouched (so a genuine same-tier ambiguity, e.g. two
+     unrelated homebrew packs sharing a name, still always prompts — the
+     setting only ever resolves the specific 2024-vs-legacy duplicate).
+     Wired into lookup() and into searchIndex()'s three real call sites
+     (importer.mjs's Problem-Imports search box; effects-builder.mjs's Cast
+     spell search and Copy-from-Compendium search) by reading
+     game.settings.get(MODULE_ID, "rulesetPreference") at each call site.
+     MODULE_ID itself moved from importer.mjs to scraper.mjs (re-exported
+     from importer.mjs unchanged) specifically so effects-builder.mjs could
+     import it without an import cycle back through importer.mjs.
+  2. "Steps of the Fey should look for keywords like spell names, ability
+     mods to create a best guess" — added guessFeatureMechanics()
+     (scraper.mjs), a pure best-effort scanner over a feature's scraped
+     descriptionHtml: real <a href="/spell:...$"> links are the primary,
+     high-confidence spell signal (freeform/Google-Docs sources with no such
+     links fall back to a conservative "cast [the] <Name> [spell]" phrase
+     matched against the actual compendium index, so it can't fire on an
+     arbitrary Title Case phrase); "your <Ability> modifier" -> a
+     `@abilities.<code>.mod` uses formula; "Short Rest"/"Long Rest" (first
+     one found wins) -> recovery period; "<Ability> saving throw" (+"spell
+     save DC" nearby -> spellcasting DC; "half...damage" nearby -> half on
+     save) -> a Save guess; dice next to a damage-type word or "Temporary
+     Hit Points"/"hit points" -> a Damage or Heal guess (attached to the
+     Save's damage-on-fail if one was found, else standalone). Wired into
+     showBuildFeatureDialog() (effects-builder.mjs) via a new
+     guessQueueEntries() that turns whatever guessFeatureMechanics() finds
+     into ordinary queue entries through the SAME buildActivityData() the
+     manual editors already use, each tagged `guessed: true` so the queue
+     row renders an "(auto-guess — review before creating)" note — nothing
+     is auto-created or hidden, it's just a pre-filled starting point the
+     user reviews/edits/removes like anything else already in the queue.
+     importer.mjs's create-feature click handler now passes the row's
+     already-scraped entry.descriptionHtml into showBuildFeatureDialog().
+  Verified with two new jsdom tests (no Foundry mocks needed for the first
+  one — applyRulesetPreference/searchIndex/guessFeatureMechanics are pure):
+  scratchpad/moduletest/ruleset-preference-test.mjs (18 checks: tier
+  collapsing for all three preference values, same-tier ambiguity correctly
+  left alone, and guessFeatureMechanics run against the REAL "Steps of the
+  Fey" and level-6 "Dreadful Step" text fetched live in session 7 — confirms
+  it independently re-derives all three of that feature's real mechanical
+  parts: Misty Step + Cha-mod uses + Long Rest recovery, Wisdom save vs.
+  spell DC, and 1d10 Temp HP — plus 2d10 Psychic on the separate
+  Dreadful-Step text, proving the damage-type classifier generalizes beyond
+  the one calibration example) and
+  scratchpad/moduletest/build-feature-guess-test.mjs (18 checks: opens
+  showBuildFeatureDialog with real Steps-of-the-Fey text and NO manual
+  clicks — queue pre-seeds with exactly the 3 expected activities, correct
+  shapes on every field, "Create Feature" produces the right built data;
+  re-run with rulesetPreference="5e" confirms the Cast activity's spell uuid
+  switches to the legacy pack; no-descriptionHtml case confirms the empty-
+  queue path is unchanged). Also re-ran the two pre-existing jsdom
+  integration tests that survived from earlier sessions
+  (scratchpad/moduletest/effects-builder-test.mjs,
+  archfey-nomatch-test.mjs) after adding a `game.settings.get` mock each was
+  missing (a real new dependency this session introduced, not a bug) — both
+  pass; effects-builder-test.mjs's queue/activity counts came out one higher
+  than its original hardcoded expectations (3 activities instead of 2)
+  because its own fixture text (the real "Beguiling Defenses" prose) DOES
+  contain a genuine "Wisdom saving throw against your spell save DC" phrase,
+  which the new guesser correctly also picks up on that page — confirmed by
+  inspection this is the new feature working as intended on a second real
+  example, not a regression, so left the test's assertions as-is rather than
+  "fixing" a stale hardcoded count.
+  README updated: "Matching rules" documents the new setting and exactly
+  when it does/doesn't apply; "Attaching effects and activities..." documents
+  the auto-guess behavior with the Steps-of-the-Fey walkthrough as the
+  concrete example.
+  Not yet re-verified live in Foundry (still blocked on V4 for the same
+  credential reason as every prior session) — worth having the user retry
+  Steps of the Fey specifically next, now that it should need zero manual
+  activity-building.
+
 - 2026-08-20 — session 8 — First real live-Foundry test of the effects
   builder (V4 finally happened, at least partially — user tried creating
   "Steps of the Fey" with a Cast activity in their actual world) and it

@@ -1,4 +1,4 @@
-import { scrapeWikidotHtml, resolveSourceUrl, isWikidotPage, assembleSubclassItem, slugify, normalizeName, searchIndex } from "./scraper.mjs";
+import { scrapeWikidotHtml, resolveSourceUrl, isWikidotPage, assembleSubclassItem, slugify, normalizeName, searchIndex, MODULE_ID, applyRulesetPreference } from "./scraper.mjs";
 import { scrapeFreeformSubclass } from "./freeform-scraper.mjs";
 import { showBuildFeatureDialog } from "./effects-builder.mjs";
 
@@ -8,7 +8,7 @@ import { showBuildFeatureDialog } from "./effects-builder.mjs";
 // freeform imports go straight through like wikidot ones do.
 const FREEFORM_CONFIDENCE_THRESHOLD = 2;
 
-export const MODULE_ID = "dnd-brewporter";
+export { MODULE_ID };
 // Local CORS-bypass proxy (see proxy/wikidot-proxy.mjs) — optional, started
 // by the user once per session. Bound to localhost only; not configurable
 // yet (single-machine setups only — see the module's plan doc for the
@@ -19,9 +19,48 @@ function packUuid(pack, id) {
   return `Compendium.${pack.metadata.packageName}.${pack.metadata.name}.${pack.documentName}.${id}`;
 }
 
-async function buildNameIndex() {
+// Finds-or-creates a nested Item folder path (e.g. ["Warlock", "Subclass
+// Features"]) so imported items land where the world's other class/subclass
+// compendiums already keep them, instead of loose at the top of the Items
+// directory. Matches by name+parent in game.folders before creating
+// anything, so it's idempotent across repeated imports and across sessions
+// — re-importing another Warlock subclass later reuses the same "Warlock"
+// folder rather than making a second one. Returns null (root) for an empty
+// path, e.g. when the caller has no known class name to file under.
+// A Folder's own `.folder` (its parent) resolves to the actual parent
+// Folder document on a real Foundry client, not the raw id string Folder.create()
+// was given — comparing it directly against a plain id (as this originally
+// did) never matches, so every call created a brand new folder instead of
+// reusing the existing one. Normalize both shapes down to a plain id/null
+// before comparing.
+function folderParentId(folder) {
+  return folder.folder?.id ?? folder.folder ?? null;
+}
+
+async function resolveFolderPath(segments) {
+  let parentId = null;
+  for (const name of segments.filter(Boolean)) {
+    let folder = game.folders.find((f) => f.type === "Item" && f.name === name && folderParentId(f) === parentId);
+    if (!folder) folder = await Folder.create({ name, type: "Item", folder: parentId, sorting: "a" });
+    parentId = folder.id;
+  }
+  return parentId;
+}
+
+// "monsterfeatures"/"monsterfeatures24" (and any third-party pack following
+// the same naming convention) hold monster/NPC-only content; everything else
+// indexable as an Item pack (spells, classfeatures, equipment, ...) is
+// player-facing. Used to hard-filter which packs get indexed at all per the
+// "contentType" setting, so the excluded kind can never be offered as a
+// match, search result, or ambiguous candidate — not just deprioritized.
+export function packContentKind(pack) {
+  return /monster/i.test(pack.metadata.name) ? "monster" : "player";
+}
+
+export async function buildNameIndex() {
+  const contentType = game.settings.get(MODULE_ID, "contentType") || "player";
   const index = new Map(); // normalized name -> [{ uuid, name, pack, tier }]
-  const itemPacks = game.packs.filter((p) => p.documentName === "Item");
+  const itemPacks = game.packs.filter((p) => p.documentName === "Item" && packContentKind(p) === contentType);
   for (const pack of itemPacks) {
     let idx;
     try {
@@ -47,8 +86,8 @@ function lookup(index, rawName) {
   const candidates = index.get(normalizeName(rawName));
   if (!candidates?.length) return { status: "none" };
 
-  const tier1 = candidates.filter((c) => c.tier === 1);
-  const pool = tier1.length ? tier1 : candidates;
+  const preference = game.settings.get(MODULE_ID, "rulesetPreference");
+  const pool = applyRulesetPreference(candidates, preference);
 
   const uniqueUuids = new Set(pool.map((c) => c.uuid));
   if (uniqueUuids.size === 1) return { status: "resolved", match: pool[0] };
@@ -114,11 +153,16 @@ function resolveItemUuids(data, index, report, pending, featureDetails = []) {
   }
 }
 
-async function createItemFromData(data, label, index, report, via, featureDetails) {
+async function createItemFromData(data, label, index, report, via, featureDetails, className) {
   const pending = [];
   resolveItemUuids(data, index, report, pending, featureDetails);
   delete data._id;
-  delete data.folder;
+  // A subclass's own item goes straight into its class's folder (e.g.
+  // "Warlock") — matching the layout of the official class/subclass
+  // compendiums — when the source page told us the class name; anything
+  // else (a bare class import, or a className-less source) is left
+  // unfiled, same as before folders existed here.
+  data.folder = className ? await resolveFolderPath([className]) : null;
   try {
     const created = await Item.create(data);
     report.created.push({ name: created.name, uuid: created.uuid, file: label, via });
@@ -248,6 +292,12 @@ async function handleFreeformResult(result, label, index, report, via) {
     usedVia = `${via}+reviewed`;
   }
 
+  // Same class/subclass-features folder layout as the wikidot path — filed
+  // under the class name the parser found in the doc's own tagline (e.g.
+  // "A Warlock Subclass"), not the review dialog's edited fields (those
+  // only cover name/classIdentifier/featuresByLevel, not this).
+  const featuresFolder = result.className ? await resolveFolderPath([result.className, "Subclass Features"]) : null;
+
   // Only features that survived into the final level→feature list (i.e.
   // weren't renamed/added during review) and that the parser actually
   // captured prose for get a real generated Item; anything else falls back
@@ -260,7 +310,9 @@ async function handleFreeformResult(result, label, index, report, via) {
       const descriptionHtml = descByKey.get(`${level}|${featureName}`);
       if (descriptionHtml) {
         try {
-          const created = await Item.create(buildFeatureItemData({ name: featureName, level: parseInt(level, 10), descriptionHtml }, name));
+          const featureData = buildFeatureItemData({ name: featureName, level: parseInt(level, 10), descriptionHtml }, name);
+          featureData.folder = featuresFolder;
+          const created = await Item.create(featureData);
           report.created.push({ name: created.name, uuid: created.uuid, file: `${label} (generated feature)`, via: "freeform-generated" });
           featuresByLevelResolved[level].push({ name: featureName, uuid: created.uuid });
           continue;
@@ -276,7 +328,7 @@ async function handleFreeformResult(result, label, index, report, via) {
     name, classIdentifier, featuresByLevel: featuresByLevelResolved,
     spellGrants: result.spellGrants, scaleColumns: result.scaleColumns, descriptionHtml: result.descriptionHtml,
   });
-  await createItemFromData(item, label, index, report, usedVia);
+  await createItemFromData(item, label, index, report, usedVia, undefined, result.className);
 }
 
 async function importFile(file, index, report) {
@@ -289,8 +341,8 @@ async function importFile(file, index, report) {
 
     const raw = await res.text();
     if (isWikidotPage(raw)) {
-      const scraped = scrapeWikidotHtml(raw, file);
-      await createItemFromData(scraped.item, label, index, report, "folder", scraped.featureDetails);
+      const scraped = scrapeWikidotHtml(raw);
+      await createItemFromData(scraped.item, label, index, report, "folder", scraped.featureDetails, scraped.className);
     } else {
       await handleFreeformResult(scrapeFreeformSubclass(raw, label), label, index, report, "folder");
     }
@@ -302,8 +354,8 @@ async function importFile(file, index, report) {
 async function importFetchedPage(html, url, index, report, via) {
   try {
     if (isWikidotPage(html)) {
-      const scraped = scrapeWikidotHtml(html, url);
-      await createItemFromData(scraped.item, url, index, report, via, scraped.featureDetails);
+      const scraped = scrapeWikidotHtml(html);
+      await createItemFromData(scraped.item, url, index, report, via, scraped.featureDetails, scraped.className);
     } else {
       await handleFreeformResult(scrapeFreeformSubclass(html, url), url, index, report, via);
     }
@@ -441,12 +493,17 @@ function showProblemImportsDialog(report, index) {
             const advId = entry.path.match(/^system\.advancement\.([^.]+)\./)?.[1];
             const level = advId ? (parentDoc.system.advancement[advId]?.level ?? 0) : 0;
 
-            const built = await showBuildFeatureDialog({ name: chosenName, index });
+            const built = await showBuildFeatureDialog({ name: chosenName, index, descriptionHtml: entry.descriptionHtml || "" });
             if (built === null) return; // cancelled from the effects/activities step
 
             const data = buildFeatureItemData({ name: chosenName, level, descriptionHtml: entry.descriptionHtml || "" }, parentDoc.name);
             if (built.effects.length) data.effects = built.effects;
             if (Object.keys(built.activities).length) data.system.activities = built.activities;
+            // File alongside the parent subclass (already placed in its
+            // class's folder when it was created) rather than re-deriving
+            // the class name here — a "Subclass Features" sibling folder
+            // next to wherever the subclass itself actually landed.
+            data.folder = parentDoc.folder ? await resolveFolderPath([parentDoc.folder.name, "Subclass Features"]) : null;
 
             const created = await Item.create(data);
             // Foundry can reject a document's data (e.g. a malformed
@@ -465,7 +522,8 @@ function showProblemImportsDialog(report, index) {
         html.on("input", ".wikidot-search-input", (ev) => {
           const input = $(ev.currentTarget);
           const resultsEl = input.siblings(".wikidot-search-results");
-          const matches = searchIndex(index, input.val());
+          const preference = game.settings.get(MODULE_ID, "rulesetPreference");
+          const matches = searchIndex(index, input.val(), 15, preference);
           resultsEl.html(matches.length ? matches.map(candidateCardHtml).join("") : "<p><em>No matches.</em></p>");
         });
         html.find(".wikidot-search-input").trigger("input");
@@ -497,7 +555,7 @@ function showReport(report, index) {
   `;
 
   new Dialog({
-    title: "Wikidot Import Report",
+    title: "Brewporter Import Report",
     content,
     buttons: { ok: { label: "Close" } },
     render: (html) => {
@@ -568,7 +626,7 @@ async function startImport(urlsText, folderPath) {
          <ul>${fetchFailed.map((r) => `<li>${r.url} — ${r.reason}</li>`).join("")}</ul>
          <p>Save those pages locally (Ctrl+S → "Webpage, HTML only") into your import folder, then re-run.</p>`
       : "<p>Nothing to import — no URLs given and no .json/.html files found in the folder.</p>";
-    new Dialog({ title: "Wikidot Import", content: onlyFailures, buttons: { ok: { label: "Close" } } }).render(true);
+    new Dialog({ title: "Brewporter Import", content: onlyFailures, buttons: { ok: { label: "Close" } } }).render(true);
     return;
   }
 
@@ -579,7 +637,7 @@ async function startImport(urlsText, folderPath) {
   const failedRows = fetchFailed.map((r) => `<li>${r.url} — ${r.reason}</li>`);
 
   const proceed = await Dialog.confirm({
-    title: "Wikidot Import",
+    title: "Brewporter Import",
     content: `
       <p>Ready to import ${readyRows.length} item(s):</p>
       <ul>${readyRows.join("")}</ul>
@@ -589,7 +647,7 @@ async function startImport(urlsText, folderPath) {
   });
   if (!proceed) return;
 
-  ui.notifications.info("Wikidot Importer | Indexing compendiums...");
+  ui.notifications.info("Brewporter | Indexing compendiums...");
   const index = await buildNameIndex();
 
   const report = { created: [], failed: [], resolved: [], unresolved: [], manualSaveNeeded: fetchFailed.map((r) => r.url) };
@@ -621,7 +679,7 @@ export async function runImport() {
   `;
 
   new Dialog({
-    title: "Wikidot D&D Importer",
+    title: "D&D Brewporter Importer",
     content,
     render: (html) => {
       const refreshProxyStatus = () => {

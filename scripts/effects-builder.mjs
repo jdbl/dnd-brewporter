@@ -17,10 +17,25 @@
 // item's own sheet, which is the authoritative place to fine-tune anything
 // this editor doesn't cover.
 
-import { randomId, searchIndex } from "./scraper.mjs";
+import { randomId, searchIndex, normalizeName, applyRulesetPreference, guessFeatureMechanics, CONDITION_WORDS, MODULE_ID } from "./scraper.mjs";
+
+function rulesetPreference() {
+  return game.settings.get(MODULE_ID, "rulesetPreference");
+}
 
 function dnd5eConfig() {
   return (typeof CONFIG !== "undefined" && CONFIG.DND5E) || null;
+}
+
+// DAE ("Dynamic Effects using Active Effects", module id "dae") extends
+// core ActiveEffects with roll-data formulas, macro triggers, and unowned/
+// transfer-item support that vanilla core AE handling doesn't reliably
+// give you. Auto-guessed effects (see guessQueueEntries below) are gated on
+// this being active/enabled — a guessed change key like
+// "system.attributes.ac.bonus" is only worth queuing automatically when the
+// world can actually make it work end-to-end.
+function isDaeActive() {
+  return typeof game !== "undefined" && !!game.modules?.get("dae")?.active;
 }
 
 function abilityOptions() {
@@ -38,6 +53,16 @@ function damageTypeOptions() {
     poison: { label: "Poison" }, psychic: { label: "Psychic" }, radiant: { label: "Radiant" }, slashing: { label: "Slashing" }, thunder: { label: "Thunder" },
   };
   return Object.entries(types).map(([value, t]) => ({ value, label: t.label ?? t.name ?? value }));
+}
+
+// Real condition ids (CONFIG.DND5E.conditionTypes) when running in Foundry,
+// same fallback list scraper.mjs's self-granted-condition detector matches
+// against otherwise — keeps the checkbox list and the auto-guesser talking
+// about the same set of status ids.
+function conditionOptions() {
+  const types = dnd5eConfig()?.conditionTypes;
+  if (types) return Object.entries(types).map(([value, t]) => ({ value, label: t.label ?? t.name ?? value }));
+  return CONDITION_WORDS.map((value) => ({ value, label: value[0].toUpperCase() + value.slice(1) }));
 }
 
 function healingTypeOptions() {
@@ -84,7 +109,7 @@ function changeKeySuggestionsHtml() {
     ...abilityKeys.map((k) => `system.abilities.${k}.bonuses.check`),
     ...abilityKeys.map((k) => `system.abilities.${k}.bonuses.save`),
     "system.bonuses.mwak.damage", "system.bonuses.rwak.damage", "system.bonuses.msak.damage", "system.bonuses.rsak.damage",
-    "system.traits.dr.value", "system.traits.di.value", "system.traits.dv.value",
+    "system.traits.dr.value", "system.traits.di.value", "system.traits.dv.value", "system.traits.ci.value",
   ];
   return `<datalist id="wikidot-change-key-suggestions">${suggestions.map((s) => `<option value="${s}">`).join("")}</datalist>`;
 }
@@ -151,6 +176,17 @@ function activeEffectFormHtml(prefill = {}) {
         <div class="wikidot-ae-changes">${changes.map(changeRowHtml).join("")}</div>
         <button type="button" class="wikidot-ae-add-change">+ Add change</button>
       </div>
+      <div class="form-group">
+        <label>Conditions to apply (e.g. Invisible) — separate from a change above; this sets the effect's actual status</label>
+        <div class="wikidot-ae-statuses" style="display:flex; flex-wrap:wrap; gap: 4px 10px;">
+          ${conditionOptions().map((c) => `
+            <label style="flex: 0 0 auto;">
+              <input type="checkbox" class="wikidot-ae-status" value="${c.value}" ${prefill.statuses?.includes(c.value) ? "checked" : ""}>
+              ${c.label}
+            </label>
+          `).join("")}
+        </div>
+      </div>
     </form>
   `;
 }
@@ -167,11 +203,16 @@ function parseActiveEffectForm(formEl) {
   const durationType = formEl.querySelector(".wikidot-ae-duration-type").value;
   const durationValue = parseInt(formEl.querySelector(".wikidot-ae-duration-value").value, 10) || null;
 
+  const statuses = Array.from(formEl.querySelectorAll(".wikidot-ae-status"))
+    .filter((cb) => cb.checked)
+    .map((cb) => cb.value);
+
   return {
     name: formEl.querySelector(".wikidot-ae-name").value.trim(),
     transfer: formEl.querySelector(".wikidot-ae-transfer").checked,
     durationType, durationValue,
     changes,
+    statuses,
   };
 }
 
@@ -192,7 +233,7 @@ export function buildActiveEffectData(form) {
     origin: null,
     tint: "#ffffff",
     transfer: !!form.transfer,
-    statuses: [],
+    statuses: form.statuses ?? [],
     flags: {},
   };
 }
@@ -208,6 +249,7 @@ function activeEffectDataToPrefill(ae) {
     transfer: ae.transfer !== false,
     durationType, durationValue,
     changes: (ae.changes ?? []).map((c) => ({ key: c.key, mode: c.mode, value: c.value })),
+    statuses: [...(ae.statuses ?? [])],
   };
 }
 
@@ -626,7 +668,7 @@ function wireSharedFormControls(html) {
 // the spell this activity casts rather than an effect/activity to copy.
 function wireCastSpellSearch(html, index) {
   html.on("input", ".wikidot-act-cast-search", (ev) => {
-    const matches = searchIndex(index, ev.currentTarget.value);
+    const matches = searchIndex(index, ev.currentTarget.value, 15, rulesetPreference());
     html.find(".wikidot-act-cast-results").html(
       matches.length
         ? matches.map((m) => `<div class="wikidot-eb-copy-item wikidot-act-cast-pick" data-uuid="${m.uuid}" data-name="${m.name}">${m.name} <em>(${m.pack})</em></div>`).join("")
@@ -661,7 +703,7 @@ export function showCopyFromCompendiumDialog(index) {
         buttons: { cancel: { label: "Cancel", callback: () => resolve(null) } },
         render: (html) => {
           html.on("input", ".wikidot-eb-copy-search", (ev) => {
-            const matches = searchIndex(index, ev.currentTarget.value);
+            const matches = searchIndex(index, ev.currentTarget.value, 15, rulesetPreference());
             html.find(".wikidot-eb-copy-results").html(
               matches.length
                 ? matches.map((m) => `<div class="wikidot-eb-copy-item" data-uuid="${m.uuid}">${m.name} <em>(${m.pack})</em></div>`).join("")
@@ -700,17 +742,124 @@ export function showCopyFromCompendiumDialog(index) {
 
 // ---- Top-level "Build Feature" dialog ----------------------------------
 
+// Looks up a name directly against the compendium index (exact match, not
+// substring) and applies the ruleset preference — used to resolve a
+// guessed spell name to a real uuid without bothering the user with a
+// search box for something already found in the source text.
+function findExactMatch(index, name, preference) {
+  const candidates = index.get(normalizeName(name));
+  if (!candidates?.length) return null;
+  return applyRulesetPreference(candidates, preference)[0];
+}
+
+// Scans the scraped feature text for recognizable mechanics (spell
+// references, ability-modifier uses formulas, rest recovery, saving
+// throws, damage/healing dice, ActiveEffect-shaped language — see
+// guessFeatureMechanics in scraper.mjs) and turns whatever it finds into
+// ordinary queue entries via the same buildActivityData()/
+// buildActiveEffectData() used by the manual editors. Nothing here is
+// final — every guess is just a normal, fully-editable/removable queue
+// row; this only saves the user from starting a feature like "Steps of
+// the Fey" (cast Misty Step, a Wisdom save vs. spell DC, 1d10 temp HP)
+// from a completely blank slate.
+//
+// Effect guesses (AC bonuses, resistances, speed, darkvision, ...) are
+// only ever queued when DAE is active (see isDaeActive) — when it isn't,
+// segments with effect-shaped hints are counted (not added) so the caller
+// can tell the user what was left out and why. Returns
+// { entries, effectHintsSkipped }.
+function guessQueueEntries(descriptionHtml, index, preference, featureName = "") {
+  if (!descriptionHtml) return { entries: [], effectHintsSkipped: 0 };
+  const { segments } = guessFeatureMechanics(descriptionHtml, index);
+  const entries = [];
+  let effectHintsSkipped = 0;
+  const daeActive = isDaeActive();
+
+  // Each segment keeps its own bold sub-option name (e.g. "Refreshing Step",
+  // "Taunting Step") when the source text had one — carried straight into the
+  // guessed activity's own name field, unlabeled (blank) segments (the
+  // feature's main, non-sub-option text) build unnamed activities same as
+  // before this per-segment split existed.
+  for (const seg of segments) {
+    const name = seg.label ?? "";
+    const heals = seg.diceHints.filter((d) => d.kind === "heal");
+    const damages = seg.diceHints.filter((d) => d.kind === "damage");
+
+    if (seg.savingThrow) {
+      entries.push({
+        kind: "activity", guessed: true,
+        data: buildActivityData("save", {
+          name,
+          saveAbility: [seg.savingThrow.ability],
+          dcMode: seg.savingThrow.dcSpellcasting ? "spellcasting" : "flat",
+          dcValue: "",
+          onSave: seg.savingThrow.onSaveHalf ? "half" : "none",
+          damageParts: damages.map((d) => ({ formula: d.formula, type: d.type })),
+        }),
+      });
+    } else {
+      for (const d of damages) {
+        entries.push({ kind: "activity", guessed: true, data: buildActivityData("damage", { name, damageParts: [{ formula: d.formula, type: d.type }], criticalBonus: "" }) });
+      }
+    }
+
+    for (const h of heals) {
+      entries.push({ kind: "activity", guessed: true, data: buildActivityData("heal", { name, healFormula: h.formula, healType: h.type }) });
+    }
+
+    for (const spellName of seg.spellNames) {
+      const match = index ? findExactMatch(index, spellName, preference) : null;
+      if (!match) continue;
+      entries.push({
+        kind: "activity", guessed: true,
+        data: buildActivityData("cast", {
+          name, activationType: "action", activationValue: null, linkedEffectIds: [],
+          spellUuid: match.uuid, spellName: match.name,
+          usesMax: seg.usesFormula ?? "", recoveryPeriod: seg.recoveryPeriod ?? "lr",
+        }),
+      });
+    }
+
+    // Status hints (e.g. Disappearing Step's "You have the Invisible
+    // condition") are a core-Foundry `statuses` entry, not a `changes` key —
+    // unlike the changes below, they don't need DAE, so they're queued
+    // unconditionally. When a segment carries both, they're combined into
+    // one Effect rather than two separate rows under the same label.
+    const hasStatuses = seg.statusHints?.length > 0;
+    const hasChanges = seg.effectHints?.length > 0;
+    if (hasChanges && !daeActive) effectHintsSkipped++;
+    if (hasStatuses || (hasChanges && daeActive)) {
+      entries.push({
+        kind: "effect", guessed: true,
+        data: buildActiveEffectData({
+          name: name || featureName || "Effect",
+          transfer: true,
+          durationType: "permanent",
+          durationValue: null,
+          changes: hasChanges && daeActive ? seg.effectHints : [],
+          statuses: hasStatuses ? seg.statusHints : [],
+        }),
+      });
+    }
+  }
+
+  return { entries, effectHintsSkipped };
+}
+
 // Entry point used by importer.mjs's "+ Create new Feature item" action.
 // Resolves { effects: [...], activities: {id: data} } on "Create Feature"
 // (possibly both empty if nothing was attached), or null if the whole
-// creation was cancelled from here.
-export function showBuildFeatureDialog({ name, index }) {
+// creation was cancelled from here. When descriptionHtml (the text scraped
+// for this feature) is given, the queue starts pre-seeded with best-guess
+// entries from guessQueueEntries() instead of empty.
+export function showBuildFeatureDialog({ name, index, descriptionHtml = "" }) {
   return new Promise((resolve) => {
-    const queue = []; // [{kind: "effect"|"activity", data}]
+    const { entries: queue, effectHintsSkipped } = guessQueueEntries(descriptionHtml, index, rulesetPreference(), name); // queue: [{kind: "effect"|"activity", data, guessed?}]
+    const hadGuesses = queue.length > 0;
 
     const queueRowHtml = (item, i) => `
       <div class="wikidot-eb-queue-row" data-idx="${i}">
-        <span>${item.kind === "effect" ? "Effect" : `Activity (${ACTIVITY_TYPE_LABELS[item.data.type] ?? item.data.type})`}: <strong>${item.data.name || "(unnamed)"}</strong></span>
+        <span>${item.kind === "effect" ? "Effect" : `Activity (${ACTIVITY_TYPE_LABELS[item.data.type] ?? item.data.type})`}: <strong>${item.data.name || "(unnamed)"}</strong>${item.guessed ? ` <em>(auto-guess — review before creating)</em>` : ""}</span>
         <button type="button" class="wikidot-eb-remove-queued" data-idx="${i}">Remove</button>
       </div>
     `;
@@ -718,6 +867,8 @@ export function showBuildFeatureDialog({ name, index }) {
     const content = `
       ${DIALOG_STYLES}
       <p>Optionally attach effects or activities to <strong>${name}</strong> before it's created. Everything stays fully editable afterward on the item sheet.</p>
+      ${hadGuesses ? `<p><em>${queue.length} item(s) below were auto-detected from the scraped text (spell references, ability modifiers, saving throws, dice) — review, edit, or remove before creating.</em></p>` : ""}
+      ${effectHintsSkipped > 0 ? `<p><em>${effectHintsSkipped} additional effect(s) (stat bonuses, resistances, speed, senses, ...) look auto-buildable but weren't added — the DAE module ("Dynamic Effects using Active Effects") isn't active in this world. Enable it to have Brewporter draft these automatically next time, or add them yourself with + New Effect.</em></p>` : ""}
       <div class="wikidot-eb-actions">
         <button type="button" class="wikidot-eb-add-effect">+ New Effect</button>
         <select class="wikidot-eb-activity-type">
@@ -726,7 +877,7 @@ export function showBuildFeatureDialog({ name, index }) {
         <button type="button" class="wikidot-eb-add-activity">+ New Activity</button>
         <button type="button" class="wikidot-eb-copy">+ Copy from Compendium…</button>
       </div>
-      <div class="wikidot-eb-queue"><p class="wikidot-eb-empty"><em>Nothing attached yet.</em></p></div>
+      <div class="wikidot-eb-queue"></div>
     `;
 
     const renderQueue = (html) => {
@@ -750,6 +901,7 @@ export function showBuildFeatureDialog({ name, index }) {
           cancel: { label: "Cancel", callback: () => resolve(null) },
         },
         render: (html) => {
+          renderQueue(html);
           html.on("click", ".wikidot-eb-add-effect", async () => {
             const result = await showActiveEffectEditorDialog();
             if (result) { queue.push(result); renderQueue(html); }

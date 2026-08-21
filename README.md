@@ -42,10 +42,10 @@ the browser making the import request is.)*
 ## Usage
 
 1. Enable this module for the world (Setup → Manage Modules).
-2. Run the **"Import Wikidot Items"** macro (auto-created in the Macros tab
-   the first time this module loads — drag it to your hotbar for one-click
-   reuse), or click **Import Wikidot Items** in the Items sidebar header if
-   it appears there.
+2. Run the **"Import Brewporter Items"** macro (auto-created in the Macros
+   tab the first time this module loads — drag it to your hotbar for
+   one-click reuse), or click **Import Brewporter Items** in the Items
+   sidebar header if it appears there.
 3. The dialog shows whether the local proxy is running, then:
    - **URLs/slugs box**: paste page slugs or URLs, one per line — wikidot
      (`cleric`, `cleric:life-domain`, `http://dnd2024.wikidot.com/fighter:main`)
@@ -62,6 +62,30 @@ the browser making the import request is.)*
    created, followed by a report of what was created (and which of direct
    fetch / the local proxy / the folder actually supplied each one), what
    UUIDs were resolved, and what still needs a manual fix on the item sheet.
+
+## Created items are filed into folders, not dropped loose
+
+Not to be confused with the "Import folder" above (a folder on disk this
+module reads saved pages *from*) — this is about where created items land
+*in the Items sidebar*, matching the layout of the official class/subclass
+compendiums instead of piling everything at the top level:
+
+- A subclass's own item (e.g. "Archfey Patron") goes straight into a
+  top-level folder named after its class (e.g. **Warlock**), read off the
+  class name the source page itself states (a wikidot subclass page's
+  breadcrumb link, or a freeform doc's "A &lt;Class&gt; Subclass" tagline)
+  — never guessed from a URL slug.
+- Any feature item generated for it (via "+ Create new Feature item", or a
+  freeform doc's auto-generated features) goes into a **Subclass Features**
+  folder nested under that same class folder — e.g. "Warlock/Subclass
+  Features".
+- Folders are found-or-created by name, so importing a second Warlock
+  subclass later reuses the same "Warlock" folder rather than making a
+  duplicate.
+- A plain class-page import (e.g. importing "Warlock" itself, not one of
+  its subclasses) isn't filed into a folder — there's no equivalent
+  "everything else" bucket for it the way there is for a subclass's
+  generated features.
 
 ## If a URL can't be fetched at all
 
@@ -130,11 +154,74 @@ Either way the row updates in place to show what it was resolved to.
 
 Clicking **+ Create new Feature item** opens a "Build Feature" step before
 the item is actually created, so you can give it mechanical teeth instead of
-just a name and description:
+just a name and description. If the source page had prose for this feature,
+the queue below doesn't start empty — it's pre-seeded with best-guess
+activities scanned out of that text, each clearly marked "(auto-guess —
+review before creating)" and fully editable/removable like anything else in
+the queue:
+
+- A spell reference (a real `<a href="/spell:...">` link on wikidot pages —
+  freeform sources fall back to matching "cast [the] &lt;Name&gt; [spell]"
+  phrasing against the actual compendium index) becomes a **Cast** activity,
+  with its uses formula guessed from an "your &lt;Ability&gt; modifier"
+  phrase (e.g. `@abilities.cha.mod`) and its recovery period guessed from
+  whichever of "Short Rest"/"Long Rest" appears first in the text.
+- An "&lt;Ability&gt; saving throw" phrase becomes a **Save** activity, with
+  the DC set to "spellcasting ability" if "spell save DC" appears nearby, and
+  "half damage on a success" detected from the word "half".
+- Dice next to a recognizable word (a damage type, or "Temporary Hit
+  Points"/"hit points") become a **Damage** or **Heal** activity's formula —
+  attached to the guessed Save activity's damage-on-fail if one was found,
+  otherwise added as its own standalone activity.
+- If the [DAE module](https://foundryvtt.com/packages/dae) ("Dynamic Effects
+  using Active Effects") is active in your world, effect-shaped language is
+  also scanned and pre-seeded as an **Effect**: "+X bonus to your AC",
+  "resistance/immunity/vulnerability to &lt;type&gt; damage", "immune to the
+  &lt;Condition&gt; condition" / "immune to being &lt;Condition&gt;" (e.g.
+  the Archfey Patron's own "Beguiling Defenses" — "You are immune to the
+  Charmed condition." — becomes a condition-immunity change, and the same
+  pattern applies to any other condition: frightened, poisoned, stunned,
+  ...), "&lt;walking/climbing/swimming/flying/burrowing&gt; speed increases
+  by X feet", and "darkvision ... X feet". DAE isn't required to use
+  effects at all — you can always build one by hand with **+ New Effect** —
+  but auto-guessing effects specifically is gated on it being active, since
+  that's what makes an attached effect reliably work end-to-end. If DAE
+  isn't active and effect-shaped language is still detected, the dialog
+  says how many were skipped and why instead of silently dropping them.
+  (These patterns are deliberately narrow — a feature phrasing resistance
+  as a comma-separated list, e.g. "resistance to bludgeoning, piercing, and
+  slashing damage", won't be picked up; add it by hand in that case.)
+- Separately from the DAE-gated changes above, a feature that grants a
+  status to whoever has it — "You have the &lt;Condition&gt; condition
+  until..." (e.g. the Archfey Patron's own "Disappearing Step" — "You have
+  the Invisible condition until the start of your next turn...") — is
+  scanned and pre-seeded as an **Effect** with that condition checked under
+  "Conditions to apply". This one always runs, DAE or not: it sets the
+  effect's own `statuses` field, a core Foundry mechanism unrelated to the
+  DAE-dependent `changes` list above.
+
+For example, importing Steps of the Fey (Archfey Patron, Level 3 — "cast
+Misty Step a number of times equal to your Charisma modifier... regain uses
+on a Long Rest... **Refreshing Step.** ...gains 1d10 Temporary Hit Points...
+**Taunting Step.** ...Wisdom saving throw against your spell save DC...")
+pre-seeds a Cast activity for Misty Step (`@abilities.cha.mod`, recovers on a
+Long Rest), a Heal activity named **Refreshing Step** (`1d10`, Temporary Hit
+Points), and a Save activity named **Taunting Step** (Wisdom, spellcasting
+DC) — nothing left to build from scratch, just review and adjust. A bolded
+lead-in like "**Refreshing Step.**" at the start of a paragraph (the wikidot
+convention for a named sub-option inside one feature) keeps that name
+attached to whatever mechanics are found in that paragraph specifically,
+rather than losing it in one flattened blob of text.
+
+Beyond the auto-seeded guesses, the same dialog also supports building
+things by hand:
 
 - **+ New Effect** — a standard Foundry ActiveEffect: name, whether it
-  applies automatically or the player toggles it on, duration, and a
-  repeatable list of changes (key + mode + value/formula).
+  applies automatically or the player toggles it on, duration, a repeatable
+  list of changes (key + mode + value/formula), and a checklist of
+  conditions to apply (Invisible, Prone, ...) — separate from the changes
+  list, since a status is its own field on the effect, not a `system.*`
+  change.
 - **+ New Activity** — pick a type (Save, Damage, Heal, Utility, or Cast) and
   fill in a form built for that type specifically: saving-throw ability and
   DC (spellcasting ability, a custom formula, or a fixed number),
@@ -165,9 +252,27 @@ one-way trip. **Cancel** on this step cancels creating the feature entirely.
   `"Indomitable (One Use)"` is stripped to `"Indomitable"` before matching,
   since the compendium entry usually doesn't carry the qualifier.
 - When a name exists in both a 2024-ruleset pack (`spells24`, `equipment24`,
-  `classes24`, ...) and an older pack of the same name, the 2024 pack wins.
+  `classes24`, ...) and an older 2014/5e pack of the same name (a reprinted
+  spell like Misty Step or Sleep is the common case), the module setting
+  **"Preferred ruleset (2024 vs. 5e/2014)"** decides automatically instead of
+  asking every time it comes up — defaults to "Always use 2024", but can be
+  switched to "Always use 2014/5e (legacy)" or back to "Ask me each time" (the
+  old behavior: every duplicate name shows both options to pick from,
+  whether that's an ambiguous-match row in the report or a spell search in
+  the Build Feature dialog's Cast activity / Copy from Compendium). This only
+  ever collapses that specific 2024-vs-legacy duplicate — a genuinely
+  ambiguous match between two unrelated packs (e.g. two different homebrew
+  items sharing a name) always still prompts, regardless of this setting.
 - Anything still ambiguous (multiple distinct matches) or unmatched is left
   blank and listed in the report — nothing blocks the rest of the import.
+- The module setting **"Content to match against (player vs. monster)"**
+  decides whether name lookups only consider player-facing compendiums
+  (`classfeatures`, `spells`, `equipment24`, ...) or only monster/NPC ones
+  (`monsterfeatures`, `monsterfeatures24`) — defaults to "Player content
+  only". The excluded kind is never even indexed, so an incidental name
+  collision with the other kind (e.g. a monster feature that happens to
+  share a name with a player class feature) can never be offered as a
+  match, a search result, or an ambiguous candidate.
 
 ## Known special cases
 

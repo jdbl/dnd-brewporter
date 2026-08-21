@@ -3,6 +3,10 @@
 // instead of cheerio. Logic is a 1:1 port — see scrape-class.mjs for the
 // original commentary on wiki page structure and Foundry schema shapes.
 
+// Defined here (rather than importer.mjs) so this module and effects-builder.mjs
+// can both reference it without an import cycle through importer.mjs.
+export const MODULE_ID = "dnd-brewporter";
+
 const ABILITY_CODES = {
   strength: "str", dexterity: "dex", constitution: "con",
   intelligence: "int", wisdom: "wis", charisma: "cha",
@@ -17,6 +21,25 @@ const SKILL_CODES = {
 };
 
 const NUMBER_WORDS = { one: 1, two: 2, three: 3, four: 4, five: 5, six: 6 };
+
+// Matches dnd5e's own CONFIG.DND5E.damageTypes keys — kept as a small local
+// list here rather than reading CONFIG.DND5E so this stays a pure function
+// callable outside a running Foundry client (jsdom tests, etc.).
+const DAMAGE_TYPE_WORDS = [
+  "acid", "bludgeoning", "cold", "fire", "force", "lightning", "necrotic",
+  "piercing", "poison", "psychic", "radiant", "slashing", "thunder",
+];
+
+// Matches dnd5e's own CONFIG.DND5E.conditionTypes keys (same rationale as
+// DAMAGE_TYPE_WORDS above — a small local list so this stays callable
+// outside a running Foundry client). None of these overlap with a damage
+// type word (compare "poisoned" here vs. "poison" above), so the condition-
+// immunity detector below can't double-fire on a damage-immunity phrase.
+export const CONDITION_WORDS = [
+  "blinded", "charmed", "deafened", "exhaustion", "frightened", "grappled",
+  "incapacitated", "invisible", "paralyzed", "petrified", "poisoned",
+  "prone", "restrained", "stunned", "unconscious",
+];
 
 // Verified against DND5E.tools in the dnd5e system's own module/config.mjs —
 // the real trait-key scheme, not guessed.
@@ -79,15 +102,40 @@ export function normalizeName(name) {
     .trim();
 }
 
+// Every name-index entry (built by importer.mjs's buildNameIndex) carries a
+// `tier` — 1 for a pack whose name ends in "24" (2024 ruleset), 2 for
+// everything else (legacy/2014 SRD packs, or any third-party compendium).
+// When a name exists under both tiers (the common "this spell got reprinted
+// in 2024" case — Misty Step, Sleep, etc.), the user's "rulesetPreference"
+// setting picks one automatically instead of prompting every time. Only
+// collapses when the preferred tier actually has a candidate; otherwise
+// falls back to whatever exists so an unrelated multi-match (e.g. two
+// different homebrew packs with the same name) is untouched and still
+// surfaces as a real ambiguous choice.
+export function applyRulesetPreference(candidates, preference) {
+  if (preference === "5e") {
+    const legacy = candidates.filter((c) => c.tier !== 1);
+    return legacy.length ? legacy : candidates;
+  }
+  if (preference === "ask") return candidates;
+  // Default ("2024" or unrecognized): 2024-tier packs win when present —
+  // matches this module's original (pre-setting) hardcoded behavior.
+  const tier2024 = candidates.filter((c) => c.tier === 1);
+  return tier2024.length ? tier2024 : candidates;
+}
+
 // Substring search over a name index (as built by importer.mjs's
 // buildNameIndex) — used by the "no match found" rows in the problem-imports
-// dialog and by effects-builder.mjs's "copy from compendium" picker.
-export function searchIndex(index, rawQuery, limit = 15) {
+// dialog and by effects-builder.mjs's "copy from compendium"/"cast a spell"
+// pickers. `preference` (see applyRulesetPreference) collapses a name that
+// exists in both the 2024 and legacy compendiums down to one result instead
+// of listing both for the user to tell apart every single search.
+export function searchIndex(index, rawQuery, limit = 15, preference = "2024") {
   const q = normalizeName(rawQuery);
   if (!q) return [];
   const results = [];
   for (const [key, candidates] of index.entries()) {
-    if (key.includes(q)) results.push(...candidates);
+    if (key.includes(q)) results.push(...applyRulesetPreference(candidates, preference));
   }
   results.sort((a, b) => {
     const an = normalizeName(a.name), bn = normalizeName(b.name);
@@ -96,6 +144,244 @@ export function searchIndex(index, rawQuery, limit = 15) {
     return aPrefix !== bPrefix ? aPrefix - bPrefix : an.localeCompare(bn);
   });
   return results.slice(0, limit);
+}
+
+// If a block-level element's very first meaningful content is a bold tag
+// (wikidot's convention for a named sub-option inside one feature, e.g.
+// "<strong>Refreshing Step.</strong> Immediately after you teleport...") this
+// returns that label ("Refreshing Step") so guessFeatureMechanics() can keep
+// it attached to whatever mechanics are found in that same block, rather than
+// flattening every sub-option's text together and losing which name went
+// with which effect. Returns null when the block doesn't open with a bold
+// tag (real text comes first, or there's no bold tag at all).
+function leadingBoldLabel(el) {
+  for (const node of el.childNodes) {
+    if (node.nodeType === 3) { // Text node — ignore pure whitespace, bail on real text
+      if (node.textContent.trim() === "") continue;
+      return null;
+    }
+    if (node.nodeType === 1) { // Element node
+      if (!/^(strong|b)$/i.test(node.tagName)) return null;
+      const label = node.textContent.trim().replace(/\.\s*$/, "");
+      return label || null;
+    }
+  }
+  return null;
+}
+
+// Runs every keyword/regex detector against one block/segment's own text —
+// shared by every segment in guessFeatureMechanics() below so a sub-option's
+// mechanics (e.g. Refreshing Step's 1d10 Temp HP) are only ever attributed to
+// that segment, not smeared across the whole feature's text.
+function scanSegmentText(text, spellNames, index) {
+  if (!spellNames.length && index) {
+    const castRe = /\bcasts?(?:ing)?\s+(?:the\s+)?((?:[A-Z][a-zA-Z']*\s*){1,4})(?:spell)?/g;
+    let cm;
+    while ((cm = castRe.exec(text))) {
+      const candidate = cm[1].trim();
+      if (candidate && index.has(normalizeName(candidate)) && !spellNames.some((n) => normalizeName(n) === normalizeName(candidate))) {
+        spellNames.push(candidate);
+      }
+    }
+  }
+
+  let usesFormula = null;
+  const modMatch = text.match(/\b(Strength|Dexterity|Constitution|Intelligence|Wisdom|Charisma)\s+modifier\b/i);
+  if (modMatch) {
+    usesFormula = `@abilities.${abilityCode(modMatch[1])}.mod`;
+  } else {
+    const numRe = new RegExp(`\\b(${Object.keys(NUMBER_WORDS).join("|")})\\s+times?\\b`, "i");
+    const numMatch = text.match(numRe);
+    if (numMatch) usesFormula = String(NUMBER_WORDS[numMatch[1].toLowerCase()]);
+  }
+
+  const srIdx = text.search(/\bshort rest\b/i);
+  const lrIdx = text.search(/\blong rest\b/i);
+  let recoveryPeriod = null;
+  if (srIdx !== -1 && (lrIdx === -1 || srIdx < lrIdx)) recoveryPeriod = "sr";
+  else if (lrIdx !== -1) recoveryPeriod = "lr";
+
+  let savingThrow = null;
+  const saveMatch = text.match(/\b(Strength|Dexterity|Constitution|Intelligence|Wisdom|Charisma)\s+saving throw\b/i);
+  if (saveMatch) {
+    savingThrow = {
+      ability: abilityCode(saveMatch[1]),
+      dcSpellcasting: /spell save DC/i.test(text),
+      onSaveHalf: /half\s*(?:as much|the)?\s*damage/i.test(text),
+    };
+  }
+
+  const diceHints = [];
+  const diceRe = /(\d+d\d+(?:\s*[+-]\s*\d+)?)\s+([A-Za-z][A-Za-z ]{0,25}?)(?=[.,;]|\s+(?:and|or)\b|$)/gi;
+  let dm;
+  while ((dm = diceRe.exec(text))) {
+    const formula = dm[1].replace(/\s+/g, "");
+    const context = dm[2].trim().toLowerCase();
+    if (/temporary hit points|temp hp/.test(context)) diceHints.push({ formula, kind: "heal", type: "temphp" });
+    else if (/\bhit points\b|healing/.test(context)) diceHints.push({ formula, kind: "heal", type: "healing" });
+    else diceHints.push({ formula, kind: "damage", type: DAMAGE_TYPE_WORDS.find((t) => context.includes(t)) ?? "" });
+  }
+
+  // ActiveEffect-shaped language — each hint is already a plain {key, mode,
+  // value} triple in Foundry's own AE change shape (same as what the manual
+  // Effect editor builds), so effects-builder.mjs can feed these straight
+  // into buildActiveEffectData() with no translation step. Deliberately
+  // narrow/conservative patterns (a handful of the most common D&D feature
+  // shapes), same philosophy as diceHints/savingThrow above — a starting
+  // point for review, not a final answer.
+  const effectHints = [];
+
+  const acMatch = text.match(/\+(\d+)(?:\s+bonus)?\s+to\s+(?:your\s+)?(?:armor class|AC)\b/i)
+    ?? text.match(/(?:armor class|AC)\s+increases?\s+by\s+(\d+)/i);
+  if (acMatch) effectHints.push({ key: "system.attributes.ac.bonus", mode: 2, value: acMatch[1] });
+
+  const traitRe = /\b(resistance|resistant|immunity|immune|vulnerability|vulnerable)\s+to\s+([a-z]+)\s+damage\b/gi;
+  let trm;
+  while ((trm = traitRe.exec(text))) {
+    const dtype = trm[2].toLowerCase();
+    if (!DAMAGE_TYPE_WORDS.includes(dtype)) continue;
+    const kind = trm[1].toLowerCase();
+    const key = /^resist/.test(kind) ? "system.traits.dr.value" : /^immun/.test(kind) ? "system.traits.di.value" : "system.traits.dv.value";
+    effectHints.push({ key, mode: 2, value: dtype });
+  }
+
+  // Condition immunity — two independent patterns rather than one combined
+  // regex, since a single "immune"/"immunity" often covers a list shared
+  // with an unrelated damage-immunity clause (e.g. dnd5e's own canonical
+  // "immune to poison damage and the Poisoned condition" phrasing — one
+  // "immune", two different targets). Requiring adjacency to "immune" would
+  // only ever catch the first item in a list like that.
+  //
+  // 2024 phrasing ("the <Condition> condition"): scanned whenever the
+  // segment mentions immune/immunity anywhere, not just directly before —
+  // trades a little precision (a "<condition> condition" mention far from
+  // any immunity language in the same segment would also match) for
+  // correctly handling shared-immune lists, consistent with this scanner's
+  // "starting point for review" philosophy elsewhere.
+  if (/\bimmun(?:e|ity)\b/i.test(text)) {
+    const conditionSuffixRe = /\b([a-z]+)\s+condition\b/gi;
+    let csm;
+    while ((csm = conditionSuffixRe.exec(text))) {
+      const condition = csm[1].toLowerCase();
+      if (CONDITION_WORDS.includes(condition)) effectHints.push({ key: "system.traits.ci.value", mode: 2, value: condition });
+    }
+  }
+
+  // 2014 phrasing ("immune to being Charmed") has no "condition" keyword to
+  // anchor on, so this one does require direct adjacency to "immune".
+  const immuneBeingRe = /\bimmune\s+to\s+being\s+([a-z]+)\b/gi;
+  let ibm;
+  while ((ibm = immuneBeingRe.exec(text))) {
+    const condition = ibm[1].toLowerCase();
+    if (CONDITION_WORDS.includes(condition)) effectHints.push({ key: "system.traits.ci.value", mode: 2, value: condition });
+  }
+
+  // Self-granted condition ("You have the Invisible condition until...",
+  // e.g. Archfey Patron's Disappearing Step) — distinct from the immunity
+  // phrasing above (that's a defensive trait; this is the feature actively
+  // applying a status to its own user) and represented completely
+  // differently in Foundry: a status slug on the ActiveEffect's own
+  // `statuses` array, not a `system.traits.*` change, so it's collected
+  // separately from effectHints/changes and doesn't need the immune guard.
+  // Skipped when the segment already reads as immunity language so a single
+  // "the Invisible condition" mention isn't double-counted as both.
+  const statusHints = [];
+  if (!/\bimmun(?:e|ity)\b/i.test(text)) {
+    const grantRe = /\b(?:have|has|gain|gains|gaining|are|become|becomes)\s+(?:the\s+)?([a-z]+)\s+condition\b/gi;
+    let gsm;
+    while ((gsm = grantRe.exec(text))) {
+      const condition = gsm[1].toLowerCase();
+      if (CONDITION_WORDS.includes(condition) && !statusHints.includes(condition)) statusHints.push(condition);
+    }
+  }
+
+  const speedMatch = text.match(/\b(walking|climbing|swimming|flying|burrowing)?\s*speed\s+increases?\s+by\s+(\d+)\s*feet/i);
+  if (speedMatch) {
+    const movementKey = { walking: "walk", climbing: "climb", swimming: "swim", flying: "fly", burrowing: "burrow" }[(speedMatch[1] ?? "walking").toLowerCase()] ?? "walk";
+    effectHints.push({ key: `system.attributes.movement.${movementKey}`, mode: 2, value: speedMatch[2] });
+  }
+
+  const darkvisionMatch = text.match(/darkvision(?:\s+(?:out to|to|of)\s+(?:a range of\s+)?)?\s*(\d+)\s*feet/i);
+  if (darkvisionMatch) effectHints.push({ key: "system.attributes.senses.darkvision", mode: 4, value: darkvisionMatch[1] });
+
+  // Multiple detectors above can independently land on the same
+  // key+value (e.g. both condition-immunity patterns matching the same
+  // condition once each) — dedupe so the guessed effect doesn't carry a
+  // redundant duplicate change.
+  const seenHints = new Set();
+  const dedupedEffectHints = effectHints.filter((h) => {
+    const dedupeKey = `${h.key} ${h.value}`;
+    if (seenHints.has(dedupeKey)) return false;
+    seenHints.add(dedupeKey);
+    return true;
+  });
+
+  return { usesFormula, recoveryPeriod, savingThrow, diceHints, effectHints: dedupedEffectHints, statusHints };
+}
+
+// Best-guess mechanics scanner for a scraped feature's prose (used by the
+// "Create new Feature item" flow's Build Feature dialog to pre-seed the
+// effects/activities queue instead of starting from a blank slate). Nothing
+// here is trusted blindly — every guess becomes a normal, fully-editable
+// queue row the user can tweak or delete before the item is created.
+//
+// The prose is split into segments at each block-level element (<p>, ...):
+// a block that opens with a bold label (wikidot's own convention for a named
+// sub-option, e.g. "Refreshing Step"/"Taunting Step" under Steps of the Fey)
+// starts a new segment carrying that label; anything else is appended to the
+// current (possibly unlabeled) segment. Each segment is scanned independently
+// so a sub-option's own mechanics stay attached to its own name instead of
+// all bleeding together into one flattened, unattributed blob.
+//
+// Two spell-name signal sources per segment, in priority order:
+//  1. Structural: a wikidot spell reference is a real <a href="/spell:...">
+//     link in the scraped descriptionHtml (parseSubclassContent keeps each
+//     feature's block outerHTML, links included) — an unambiguous, high-
+//     confidence signal, unlike keyword-guessing prose.
+//  2. Textual fallback (mainly for freeform/Google-Docs sources, which have
+//     no such links): a light "cast [the] <Name> [spell]" pattern checked
+//     against the actual compendium index, so it only fires on names that
+//     really exist rather than any Title Case phrase.
+// Everything else (ability-modifier uses formula, rest-recovery period,
+// saving-throw ability + spell-DC, damage/healing dice, ActiveEffect-shaped
+// language — AC bonuses, damage resistance/immunity/vulnerability, condition
+// immunity, self-granted conditions e.g. "You have the Invisible condition",
+// speed increases, darkvision) is plain keyword/regex scanning —
+// deliberately simple and conservative (e.g. only classifies a damage type
+// when a known damage-type word appears right next to the dice) since these
+// are meant as a starting point for review, not a final answer.
+export function guessFeatureMechanics(descriptionHtml, index = null) {
+  const doc = new DOMParser().parseFromString(descriptionHtml || "", "text/html");
+  const blocks = Array.from(doc.body?.children ?? []);
+
+  const rawSegments = []; // [{ label, els: [...] }]
+  let current = { label: null, els: [] };
+  for (const el of blocks) {
+    const label = leadingBoldLabel(el);
+    if (label) {
+      if (current.els.length) rawSegments.push(current);
+      current = { label, els: [el] };
+    } else {
+      current.els.push(el);
+    }
+  }
+  if (current.els.length) rawSegments.push(current);
+  if (!rawSegments.length) rawSegments.push({ label: null, els: [] });
+
+  const segments = rawSegments.map(({ label, els }) => {
+    const spellNames = [];
+    const addSpellName = (name) => {
+      const trimmed = name?.trim();
+      if (trimmed && !spellNames.some((n) => normalizeName(n) === normalizeName(trimmed))) spellNames.push(trimmed);
+    };
+    for (const el of els) el.querySelectorAll("a[href*='spell:'], a[href*='/spell/']").forEach((a) => addSpellName(a.textContent));
+
+    const text = els.map((el) => el.textContent).join(" ").replace(/\s+/g, " ").trim();
+    const scanned = scanSegmentText(text, spellNames, index);
+    return { label, spellNames, ...scanned };
+  });
+
+  return { segments };
 }
 
 function abilityCode(name) {
@@ -508,14 +794,24 @@ function buildAdvancement({ traits, featuresByLevel, scaleColumns }) {
 
 // ---- Subclass pages ---------------------------------------------------
 
-function deriveClassIdentifierFromBreadcrumb(doc, fallbackSlug) {
+// Reads the parent class's real identifier AND its clean display name (e.g.
+// "warlock" / "Warlock") off the last breadcrumb link — the only place a
+// wikidot subclass page states its class relationship. No URL-slug fallback:
+// a wikidot URL's "class:subclass" path is the class's own routing slug, not
+// necessarily its display name (and for a subclass page, the tail after the
+// LAST colon is the subclass's own slug, not the class's, so guessing from
+// it — the previous behavior here — could silently mislabel the class).
+// Returns null if the breadcrumbs don't have the expected structure; callers
+// are expected to fail loudly rather than build an item with a guessed
+// identifier/folder.
+function deriveClassFromBreadcrumb(doc) {
   const links = doc.querySelectorAll(".breadcrumbs a");
-  if (links.length) {
-    const href = links[links.length - 1].getAttribute("href") || "";
-    const m = href.match(/^\/([a-z0-9-]+):/i);
-    if (m) return slugify(m[1]);
-  }
-  return fallbackSlug ? slugify(fallbackSlug) : null;
+  if (!links.length) return null;
+  const last = links[links.length - 1];
+  const href = last.getAttribute("href") || "";
+  const m = href.match(/^\/([a-z0-9-]+):/i);
+  if (!m) return null;
+  return { identifier: slugify(m[1]), name: text(last) || null };
 }
 
 function deriveSubclassIdentifier(name) {
@@ -771,7 +1067,7 @@ function scrapeClass(doc, content) {
 // Shared by both the wikidot subclass path and the freeform-doc path (see
 // freeform-scraper.mjs) — either one only needs to produce this intermediate
 // shape, not duplicate item-assembly/advancement-building logic.
-export function assembleSubclassItem({ name, classIdentifier, descriptionHtml, featuresByLevel, spellGrants, scaleColumns }) {
+export function assembleSubclassItem({ name, classIdentifier, className, descriptionHtml, featuresByLevel, spellGrants, scaleColumns }) {
   const identifier = deriveSubclassIdentifier(name);
   const advancement = buildSubclassAdvancement({ featuresByLevel, spellGrants, scaleColumns });
 
@@ -795,19 +1091,22 @@ export function assembleSubclassItem({ name, classIdentifier, descriptionHtml, f
     ownership: { default: 0 },
   };
 
-  return { type: "subclass", item };
+  return { type: "subclass", item, className: className ?? null };
 }
 
-function scrapeSubclass(doc, content, sourceUrl) {
+function scrapeSubclass(doc, content) {
   const subclassName = text(doc.querySelector(".breadcrumbs")).split("»").pop().trim()
     || text(doc.querySelector("title")).split(" - ")[0].trim();
   if (!subclassName) throw new Error("Could not determine subclass name from the page.");
 
-  const fallbackClassSlug = sourceUrl?.includes(":") ? sourceUrl.split(":").pop().split("/").pop() : null;
-  const classIdentifier = deriveClassIdentifierFromBreadcrumb(doc, fallbackClassSlug);
+  const classInfo = deriveClassFromBreadcrumb(doc);
+  if (!classInfo) throw new Error("Could not determine the parent class from the page's breadcrumbs.");
   const descriptionHtml = buildSubclassDescription(content);
   const { featuresByLevel, featureDetails, spellGrants, scaleColumns } = parseSubclassContent(content);
-  const result = assembleSubclassItem({ name: subclassName, classIdentifier, descriptionHtml, featuresByLevel, spellGrants, scaleColumns });
+  const result = assembleSubclassItem({
+    name: subclassName, classIdentifier: classInfo.identifier, className: classInfo.name,
+    descriptionHtml, featuresByLevel, spellGrants, scaleColumns,
+  });
   return { ...result, featureDetails };
 }
 
@@ -820,13 +1119,13 @@ export function isWikidotPage(html) {
 
 // Parses raw wiki page HTML (as fetched or as saved-to-disk by the user) into
 // a Foundry item document. Throws if the page type can't be determined.
-export function scrapeWikidotHtml(html, sourceUrl) {
+export function scrapeWikidotHtml(html) {
   const doc = new DOMParser().parseFromString(html, "text/html");
   const content = doc.querySelector("#page-content");
   if (!content) throw new Error("This doesn't look like a dnd2024.wikidot.com page (no #page-content found).");
 
   const pageType = detectPageType(doc);
   if (pageType === "class") return scrapeClass(doc, content);
-  if (pageType === "subclass") return scrapeSubclass(doc, content, sourceUrl);
+  if (pageType === "subclass") return scrapeSubclass(doc, content);
   throw new Error("Could not tell whether this is a class or subclass page (no recognizable page-tags found).");
 }
