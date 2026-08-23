@@ -1,6 +1,7 @@
 import { scrapeWikidotHtml, resolveSourceUrl, isWikidotPage, assembleSubclassItem, slugify, normalizeName, searchIndex, MODULE_ID, applyRulesetPreference } from "./scraper.mjs";
 import { scrapeFreeformSubclass } from "./freeform-scraper.mjs";
 import { showBuildFeatureDialog } from "./effects-builder.mjs";
+import { sendDdbAuth, fetchDdbGameData, assembleFeatItem, usableRacialTraits, assembleRaceTraitItem, assembleRaceItem, featFolderSegments, raceTraitFolderSegments, raceFolderSegments } from "./ddb-scraper.mjs";
 
 // Below this many detected "Nth Level:" headings, a freeform parse is
 // shown for review before creating anything — a strong sign the doc
@@ -161,8 +162,14 @@ async function createItemFromData(data, label, index, report, via, featureDetail
   // "Warlock") — matching the layout of the official class/subclass
   // compendiums — when the source page told us the class name; anything
   // else (a bare class import, or a className-less source) is left
-  // unfiled, same as before folders existed here.
-  data.folder = className ? await resolveFolderPath([className]) : null;
+  // unfiled, same as before folders existed here. Accepts either a single
+  // folder name or a full segment path (["Feats", "General Feats"]) for
+  // callers that need deeper nesting.
+  if (className) {
+    data.folder = await resolveFolderPath(Array.isArray(className) ? className : [className]);
+  } else {
+    data.folder = null;
+  }
   try {
     const created = await Item.create(data);
     report.created.push({ name: created.name, uuid: created.uuid, file: label, via });
@@ -566,6 +573,92 @@ function showReport(report, index) {
   console.log(`${MODULE_ID} | Import report`, report);
 }
 
+// ---- D&D Beyond import -------------------------------------------------
+//
+// Unlike the wikidot/freeform paths, DDB gives us structured JSON directly
+// — no name-lookup FIXME placeholders needed for a species' own traits,
+// since createItemFromData's resolveItemUuids only acts on entries with an
+// unresolved _name/_item hint, which these never have. Race traits are
+// still created feature-by-feature first (mirroring handleFreeformResult's
+// generated-feature loop) so their real UUIDs exist before the race item's
+// ItemGrant advancement is assembled.
+
+async function ensureDdbAuth() {
+  const cobalt = game.settings.get(MODULE_ID, "ddbCobaltSession");
+  if (!cobalt) {
+    throw new Error('No CobaltSession configured — set "D&D Beyond CobaltSession token" in this module\'s settings first.');
+  }
+  const result = await sendDdbAuth(cobalt);
+  if (!result.success) throw new Error(`D&D Beyond auth failed: ${result.message ?? "unknown error"}`);
+}
+
+async function importDdbFeat(featDef, index, report) {
+  await createItemFromData(assembleFeatItem(featDef), featDef.name, index, report, "ddb", undefined, featFolderSegments(featDef));
+}
+
+async function importDdbRace(raceDef, index, report) {
+  try {
+    const traits = usableRacialTraits(raceDef);
+    const traitsFolder = await resolveFolderPath(raceTraitFolderSegments(raceDef));
+    const traitsByLevel = {};
+    for (const trait of traits) {
+      const data = assembleRaceTraitItem(trait, raceDef);
+      data.folder = traitsFolder;
+      const created = await Item.create(data);
+      if (!created) throw new Error(`Foundry rejected trait "${trait.name}"'s data (check the browser console for a DataModelValidationError).`);
+      report.created.push({ name: created.name, uuid: created.uuid, file: `${raceDef.fullName} (trait)`, via: "ddb" });
+      const level = trait.requiredLevel ?? 0;
+      (traitsByLevel[level] ??= []).push({ name: created.name, uuid: created.uuid });
+    }
+    await createItemFromData(assembleRaceItem(raceDef, traitsByLevel), raceDef.fullName, index, report, "ddb", undefined, raceFolderSegments());
+  } catch (err) {
+    report.failed.push({ file: raceDef.fullName, reason: err.message ?? String(err) });
+  }
+}
+
+async function startDdbImport(kind) {
+  if (!game.user.isGM) {
+    ui.notifications.error("Only a GM can import items.");
+    return;
+  }
+
+  const infoDialog = (content) => new Dialog({ title: "Brewporter Import", content, buttons: { ok: { label: "Close" } } }).render(true);
+
+  try {
+    await ensureDdbAuth();
+  } catch (err) {
+    infoDialog(`<p>${err.message}</p>`);
+    return;
+  }
+
+  const type = kind === "feats" ? "feats" : "races";
+  let items;
+  try {
+    items = await fetchDdbGameData(type);
+  } catch (err) {
+    infoDialog(`<p>${err.message}</p>`);
+    return;
+  }
+
+  const label = kind === "feats" ? "feat" : "species";
+  const proceed = await Dialog.confirm({
+    title: "Brewporter Import",
+    content: `<p>Ready to import ${items.length} ${label}${items.length === 1 ? "" : "s"} available on your D&D Beyond account.</p>`,
+  });
+  if (!proceed) return;
+
+  ui.notifications.info("Brewporter | Indexing compendiums...");
+  const index = await buildNameIndex();
+  const report = { created: [], failed: [], resolved: [], unresolved: [], manualSaveNeeded: [] };
+
+  for (const item of items) {
+    if (kind === "feats") await importDdbFeat(item, index, report);
+    else await importDdbRace(item, index, report);
+  }
+
+  showReport(report, index);
+}
+
 async function checkProxyHealth() {
   try {
     const res = await fetch(`${PROXY_URL}/health`, { signal: AbortSignal.timeout(1500) });
@@ -675,6 +768,14 @@ export async function runImport() {
           <button type="button" class="wikidot-browse-folder">Browse</button>
         </div>
       </div>
+      <div class="form-group">
+        <label>D&amp;D Beyond (your account's Species &amp; Feats)</label>
+        <p class="ddb-cobalt-status hint" style="margin:0 0 4px;"></p>
+        <div style="display:flex; gap:4px;">
+          <button type="button" class="ddb-import-species">Import All Species</button>
+          <button type="button" class="ddb-import-feats">Import All Feats</button>
+        </div>
+      </div>
     </form>
   `;
 
@@ -703,6 +804,15 @@ export async function runImport() {
           callback: (path) => html.find("[name=folder]").val(path),
         }).render(true);
       });
+
+      const cobaltConfigured = !!game.settings.get(MODULE_ID, "ddbCobaltSession");
+      html.find(".ddb-cobalt-status").text(
+        cobaltConfigured
+          ? "CobaltSession token configured — uses the same local proxy above."
+          : 'No CobaltSession token set — add one in this module\'s settings first ("D&D Beyond CobaltSession token").'
+      );
+      html.find(".ddb-import-species").on("click", () => startDdbImport("species"));
+      html.find(".ddb-import-feats").on("click", () => startDdbImport("feats"));
     },
     buttons: {
       run: {

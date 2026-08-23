@@ -20,6 +20,15 @@ Hooks.once("init", () => {
     default: "2024",
   });
 
+  game.settings.register(MODULE_ID, "ddbCobaltSession", {
+    name: "D&D Beyond CobaltSession token",
+    hint: "Your D&D Beyond login cookie value, used to pull species/feat data you have access to. This is a credential, not a password you type here for us — it's your browser's own DevTools → Storage/Application → Cookies → www.dndbeyond.com → CobaltSession value, copied in. It is sent only to your local proxy (proxy/wikidot-proxy.mjs) running on 127.0.0.1, never anywhere else, and is held in this world's settings storage — treat it like a password and don't share your world file/backups with it filled in if that concerns you.",
+    scope: "world",
+    config: true,
+    type: String,
+    default: "",
+  });
+
   game.settings.register(MODULE_ID, "contentType", {
     name: "Content to match against (player vs. monster)",
     hint: "Whether name lookups (spells, features, equipment, ...) should only consider player-facing compendiums or only monster/NPC ones. Prevents an incidental name collision with the other kind (e.g. a monster feature sharing a name with a player class feature) from ever being offered or auto-resolved — the excluded kind is never even indexed, so it can't show up as a match, a search result, or an ambiguous candidate.",

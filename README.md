@@ -274,6 +274,38 @@ one-way trip. **Cancel** on this step cancels creating the feature entirely.
   share a name with a player class feature) can never be offered as a
   match, a search result, or an ambiguous candidate.
 
+## D&D Beyond: Species & Feats
+
+Alongside wikidot/homebrew class content, the importer dialog has an
+**Import All Species** / **Import All Feats** pair of buttons that pull
+directly from your D&D Beyond account — every species and feat you have
+access to (owned books, homebrew you've enabled), not just SRD content.
+
+**One-time setup**, in addition to the local proxy above (it handles this
+too — same `node proxy/wikidot-proxy.mjs` command, no separate process):
+
+1. Log into dndbeyond.com in your browser.
+2. Open DevTools → Storage (Firefox) / Application (Chrome) → Cookies →
+   `https://www.dndbeyond.com` → copy the `CobaltSession` cookie's value.
+3. Paste it into this module's **"D&D Beyond CobaltSession token"** setting.
+
+This value is your D&D Beyond login token — treat it like a password. It's
+sent only to your own local proxy on `127.0.0.1`, held in memory there
+(never written to disk by the proxy), and used solely to exchange for a
+short-lived API token from D&D Beyond's own auth service. It's stored in
+this world's module settings, though, so don't share a world
+export/backup with it filled in if that's a concern — clear the setting
+first.
+
+Each species is created as a **Species** item filing its racial traits as
+separate Feature items into `Species/<Race Name>` (mirroring the
+`<Class>/Subclass Features` layout used elsewhere), linked via the same
+`ItemGrant` advancement classes/subclasses use. Feats land in a top-level
+**Feats** folder, one item each, with any listed prerequisite noted at the
+top of the description. Neither path runs the auto-guess effects/activities
+scan — that's still available afterward the same way as any other created
+item, by hand on the item sheet.
+
 ## Known special cases
 
 - **Artificer** isn't part of the 2024 PHB, so there's no `artificer`-specific
