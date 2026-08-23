@@ -32,7 +32,7 @@ const PORT = 8091;
 // browser. The bearer is short-lived (~5 minutes observed); this refreshes
 // it transparently using the last cobalt value it was given, so the
 // Foundry-side client never has to think about expiry.
-const DDB_GAME_DATA_TYPES = new Set(["races", "feats", "classes", "backgrounds"]);
+const DDB_GAME_DATA_TYPES = new Set(["races", "feats", "classes", "backgrounds", "subclasses"]);
 let ddbCobalt = null;
 let ddbBearer = null;
 let ddbBearerExpiresAt = 0;
@@ -131,9 +131,19 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(400, { "Content-Type": "application/json" }).end(JSON.stringify({ success: false, message: `Unsupported type "${type}"` }));
       return;
     }
+    // "subclasses" requires baseClassId (D&D Beyond scopes it per parent
+    // class, unlike races/feats/classes/backgrounds which return everything
+    // in one call) — forwarded straight through, sharingSetting is always
+    // forced to 2 regardless of what the client sent.
+    if (type === "subclasses" && !/^\d+$/.test(url.searchParams.get("baseClassId") ?? "")) {
+      res.writeHead(400, { "Content-Type": "application/json" }).end(JSON.stringify({ success: false, message: "subclasses requires a numeric ?baseClassId=" }));
+      return;
+    }
     try {
       const bearer = await getDdbBearer();
-      const upstream = await fetch(`https://character-service.dndbeyond.com/character/v5/game-data/${type}?sharingSetting=2`, {
+      const upstreamParams = new URLSearchParams(url.search);
+      upstreamParams.set("sharingSetting", "2");
+      const upstream = await fetch(`https://character-service.dndbeyond.com/character/v5/game-data/${type}?${upstreamParams}`, {
         headers: { Authorization: `Bearer ${bearer}` },
       });
       if (upstream.status === 401) {

@@ -274,13 +274,13 @@ one-way trip. **Cancel** on this step cancels creating the feature entirely.
   share a name with a player class feature) can never be offered as a
   match, a search result, or an ambiguous candidate.
 
-## D&D Beyond: Species, Feats & Classes
+## D&D Beyond: Species, Feats, Classes & Subclasses
 
 Alongside wikidot/homebrew class content, the importer dialog has
-**Import All Species** / **Import All Feats** / **Import All Classes**
-buttons that pull directly from your D&D Beyond account — everything you
-have access to (owned books, homebrew you've enabled), not just SRD
-content.
+**Import All Species** / **Import All Feats** / **Import All Classes** /
+**Import All Subclasses** buttons that pull directly from your D&D Beyond
+account — everything you have access to (owned books, homebrew you've
+enabled), not just SRD content.
 
 **One-time setup**, in addition to the local proxy above (it handles this
 too — same `node proxy/wikidot-proxy.mjs` command, no separate process):
@@ -324,11 +324,25 @@ there if you have the system's bundled 2024 content. A name that doesn't
 resolve lands in the normal **Problem Imports** review list, pre-seeded
 with D&D Beyond's own description text for **+ Create new Feature item**
 (the wikidot class path doesn't have text to offer there today — only its
-subclass path does). Subclasses aren't available through this yet — D&D
-Beyond's subclass data doesn't come back from the same catalog call classes
-do, and needs its own endpoint confirmed before it can be built.
+subclass path does).
 
-None of the three paths run the auto-guess effects/activities scan — that's
+**Subclasses**: there's no bulk "all subclasses" endpoint — D&D Beyond only
+returns them scoped to one base class at a time, so this fetches every
+class first and makes one further request per class (noticeably slower
+than the other three imports; the dialog says so while it runs). A
+subclass definition's own feature list isn't subclass-only — it's the
+*full* combined class+subclass list — so this diffs it against the parent
+class's own features (matched by D&D Beyond's internal feature id, not
+name, since some inherited entries share exact names with genuinely
+distinct features elsewhere) to isolate what the subclass actually adds.
+dnd5e's own subclasses pack ships with no folder structure at all to
+match, so this follows the module's own established layout instead: the
+subclass item lands in its parent class's folder (same as a wikidot-
+imported subclass), with its features in a `<Class Name>/Subclass
+Features` sibling folder. Features go through the same name-lookup/
+Problem-Imports path as class features.
+
+None of the four paths run the auto-guess effects/activities scan — that's
 still available afterward the same way as any other created item, by hand
 on the item sheet.
 

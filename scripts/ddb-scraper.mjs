@@ -50,10 +50,11 @@ export async function sendDdbAuth(cobalt) {
 // Throws with a message suitable for direct display — callers don't need
 // to know the difference between "proxy unreachable", "not authed yet",
 // and "DDB rejected the request".
-export async function fetchDdbGameData(type) {
+export async function fetchDdbGameData(type, params = {}) {
+  const qs = new URLSearchParams(params).toString();
   let res;
   try {
-    res = await fetch(`${PROXY_URL}/ddb/game-data/${type}`, { signal: AbortSignal.timeout(15000) });
+    res = await fetch(`${PROXY_URL}/ddb/game-data/${type}${qs ? `?${qs}` : ""}`, { signal: AbortSignal.timeout(15000) });
   } catch (err) {
     throw new Error(`Could not reach the local proxy at ${PROXY_URL} (start it with "node proxy/wikidot-proxy.mjs"): ${err.message}`);
   }
@@ -346,26 +347,30 @@ function cleanFeatureName(name) {
 // item's own description, not a real granted feature.
 const CORE_TRAITS_HEADER = /^Core .+ Traits$/i;
 
-function buildClassAdvancement(classDef) {
+// Shared by both classes (which also get a HitPoints entry) and subclasses
+// (which don't — HitPoints/hit dice belong to the base class only) so a
+// Barbarian and a Path of the Berserker build their per-level ItemGrant/
+// ASI/Subclass-placeholder advancement the exact same way.
+function buildFeatureAdvancement(features, { includeHitPoints }) {
   const advancement = {};
   const add = (entry) => {
     const id = randomId();
     advancement[id] = { _id: id, value: {}, title: "", hint: "", flags: {}, ...entry };
   };
-  add({ type: "HitPoints", configuration: {} });
+  if (includeHitPoints) add({ type: "HitPoints", configuration: {} });
 
   const byLevel = {};
-  for (const f of classDef.classFeatures ?? []) {
+  for (const f of features) {
     if (CORE_TRAITS_HEADER.test(f.name)) continue;
     (byLevel[f.requiredLevel ?? 1] ??= []).push({ ...f, name: cleanFeatureName(f.name) });
   }
 
   const featureDetails = [];
-  for (const [levelStr, features] of Object.entries(byLevel)) {
+  for (const [levelStr, levelFeatures] of Object.entries(byLevel)) {
     const level = parseInt(levelStr, 10);
-    const isASI = features.some((f) => /^Ability Score Improvement$/i.test(f.name));
-    const isSubclassLevel = features.some((f) => /Subclass$/i.test(f.name) && !/^Subclass Feature$/i.test(f.name));
-    const named = features.filter((f) =>
+    const isASI = levelFeatures.some((f) => /^Ability Score Improvement$/i.test(f.name));
+    const isSubclassLevel = levelFeatures.some((f) => /Subclass$/i.test(f.name) && !/^Subclass Feature$/i.test(f.name));
+    const named = levelFeatures.filter((f) =>
       !/^Ability Score Improvement$/i.test(f.name) && !/Subclass$/i.test(f.name) && !/^Subclass Feature$/i.test(f.name));
 
     if (isSubclassLevel) add({ type: "Subclass", configuration: {}, value: { document: null, uuid: null }, level });
@@ -387,6 +392,10 @@ function buildClassAdvancement(classDef) {
   }
 
   return { advancement, featureDetails };
+}
+
+function buildClassAdvancement(classDef) {
+  return buildFeatureAdvancement(classDef.classFeatures ?? [], { includeHitPoints: true });
 }
 
 // Returns { item, featureDetails } — featureDetails is passed straight
@@ -422,6 +431,80 @@ export function assembleClassItem(classDef) {
       },
       effects: [],
       flags: { "dnd-brewporter": { ddbId: classDef.id, ddbSlug: classDef.slug } },
+      _stats: baseStats(),
+      ownership: { default: 0 },
+    },
+  };
+}
+
+// ---- Subclasses ----------------------------------------------------------
+//
+// There's no bulk "all subclasses" catalog — D&D Beyond only returns them
+// scoped to one base class at a time (confirmed live: GET .../game-data/
+// subclasses?sharingSetting=2&baseClassId=<id>). Callers need to fetch
+// game-data/classes first and pass each class's id in.
+//
+// A subclass definition's own classFeatures list isn't subclass-only —
+// it's the *combined* class+subclass feature list (confirmed against a
+// real Wizard/Evoker pair: Evoker's classFeatures includes Wizard's own
+// Spellcasting, Ability Score Improvement, etc. verbatim). Diffing by
+// feature id against the parent class's own classFeatures is what
+// isolates the 5 real Evoker-only features from the 14 inherited ones —
+// name-matching wouldn't be reliable (some inherited entries share exact
+// names with genuinely distinct subclass features elsewhere).
+export function classFeatureIds(classDef) {
+  return new Set((classDef.classFeatures ?? []).map((f) => f.id));
+}
+
+function subclassOnlyFeatures(subclassDef, parentClassDef) {
+  const parentIds = classFeatureIds(parentClassDef);
+  return (subclassDef.classFeatures ?? []).filter((f) => !parentIds.has(f.id));
+}
+
+// dnd5e's own subclasses pack ships flat (no per-class folders at all) —
+// there's no official convention to match here, so this follows the
+// module's own established one instead: a subclass's own item sits
+// straight in its class's folder (classFolderSegments), same as the
+// wikidot subclass path; its features get a sibling subfolder.
+export function subclassFolderSegments(parentClassDef) {
+  return [...classFolderSegments(parentClassDef), "Subclass Features"];
+}
+
+// Returns { item, featureDetails } as assembleClassItem does. Subclass
+// features reuse the same name-lookup/FIXME mechanism as class features
+// (see assembleClassItem's own comment) for the same reason: some will
+// already be in the user's installed compendiums, some (splatbook-
+// specific subclasses) won't be, and either way D&D Beyond's own
+// description text is available to seed "+ Create new Feature item" on a
+// miss.
+export function assembleSubclassItem(subclassDef, parentClassDef) {
+  const parentIdentifier = slugify(parentClassDef.name);
+  const { advancement, featureDetails } = buildFeatureAdvancement(
+    subclassOnlyFeatures(subclassDef, parentClassDef),
+    { includeHitPoints: false },
+  );
+
+  return {
+    featureDetails,
+    item: {
+      _id: randomId(),
+      name: subclassDef.name,
+      type: "subclass",
+      folder: null,
+      img: subclassDef.avatarUrl || `systems/dnd5e/icons/classes/${parentIdentifier}.webp`,
+      system: {
+        description: { value: subclassDef.description ?? "", chat: "" },
+        // A subclass follows its parent class's ruleset, not any id range
+        // of its own — subclassDef.id doesn't fall in the same
+        // legacy-vs-2024 numeric split classes do.
+        source: sourceField(isLegacyClass(parentClassDef)),
+        identifier: slugify(subclassDef.name),
+        classIdentifier: parentIdentifier,
+        advancement,
+        spellcasting: { progression: "none", ability: "", preparation: { formula: "" } },
+      },
+      effects: [],
+      flags: { "dnd-brewporter": { ddbId: subclassDef.id, ddbSlug: subclassDef.slug, ddbParentClassId: subclassDef.parentClassId } },
       _stats: baseStats(),
       ownership: { default: 0 },
     },

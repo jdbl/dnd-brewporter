@@ -1,7 +1,7 @@
 import { scrapeWikidotHtml, resolveSourceUrl, isWikidotPage, assembleSubclassItem, slugify, normalizeName, searchIndex, MODULE_ID, applyRulesetPreference } from "./scraper.mjs";
 import { scrapeFreeformSubclass } from "./freeform-scraper.mjs";
 import { showBuildFeatureDialog } from "./effects-builder.mjs";
-import { sendDdbAuth, fetchDdbGameData, assembleFeatItem, usableRacialTraits, assembleRaceTraitItem, assembleRaceItem, featFolderSegments, raceTraitFolderSegments, raceFolderSegments, assembleClassItem, classFolderSegments } from "./ddb-scraper.mjs";
+import { sendDdbAuth, fetchDdbGameData, assembleFeatItem, usableRacialTraits, assembleRaceTraitItem, assembleRaceItem, featFolderSegments, raceTraitFolderSegments, raceFolderSegments, assembleClassItem, classFolderSegments, assembleSubclassItem as assembleDdbSubclassItem, subclassFolderSegments } from "./ddb-scraper.mjs";
 
 // Below this many detected "Nth Level:" headings, a freeform parse is
 // shown for review before creating anything — a strong sign the doc
@@ -625,6 +625,30 @@ async function importDdbRace(raceDef, index, report) {
   }
 }
 
+async function importDdbSubclass({ subclassDef, parentClassDef }, index, report) {
+  try {
+    const { item, featureDetails } = assembleDdbSubclassItem(subclassDef, parentClassDef);
+    await createItemFromData(item, subclassDef.name, index, report, "ddb", featureDetails, subclassFolderSegments(parentClassDef));
+  } catch (err) {
+    report.failed.push({ file: subclassDef.name, reason: err.message ?? String(err) });
+  }
+}
+
+// No bulk "all subclasses" endpoint exists (see ddb-scraper.mjs) — this
+// fetches every base class first, then makes one subclasses call per
+// class id, pairing each result with the parent class assembleSubclassItem
+// needs to diff out inherited features. N+1 calls, but classes/subclasses
+// only needs to run occasionally, not per-character.
+async function fetchAllDdbSubclassPairs() {
+  const classes = await fetchDdbGameData("classes");
+  const pairs = [];
+  for (const parentClassDef of classes) {
+    const subclasses = await fetchDdbGameData("subclasses", { baseClassId: parentClassDef.id });
+    for (const subclassDef of subclasses) pairs.push({ subclassDef, parentClassDef });
+  }
+  return pairs;
+}
+
 async function startDdbImport(kind) {
   if (!game.user.isGM) {
     ui.notifications.error("Only a GM can import items.");
@@ -644,12 +668,21 @@ async function startDdbImport(kind) {
     feats: { type: "feats", label: "feat" },
     species: { type: "races", label: "species" },
     classes: { type: "classes", label: "class" },
+    subclasses: { label: "subclass" }, // fetched separately below — no single game-data type
   };
-  const { type, label } = DDB_KIND_CONFIG[kind];
+  const { label } = DDB_KIND_CONFIG[kind];
 
   let items;
   try {
-    items = await fetchDdbGameData(type);
+    if (kind === "subclasses") {
+      // One request per base class (no bulk endpoint exists) — noticeably
+      // slower than the other imports, so say so up front rather than
+      // leaving the dialog looking stuck.
+      ui.notifications.info("Brewporter | Fetching subclasses (one request per class — this takes longer than the other imports)...");
+      items = await fetchAllDdbSubclassPairs();
+    } else {
+      items = await fetchDdbGameData(DDB_KIND_CONFIG[kind].type);
+    }
   } catch (err) {
     infoDialog(`<p>${err.message}</p>`);
     return;
@@ -668,6 +701,7 @@ async function startDdbImport(kind) {
   for (const item of items) {
     if (kind === "feats") await importDdbFeat(item, index, report);
     else if (kind === "classes") await importDdbClass(item, index, report);
+    else if (kind === "subclasses") await importDdbSubclass(item, index, report);
     else await importDdbRace(item, index, report);
   }
 
@@ -790,6 +824,7 @@ export async function runImport() {
           <button type="button" class="ddb-import-species">Import All Species</button>
           <button type="button" class="ddb-import-feats">Import All Feats</button>
           <button type="button" class="ddb-import-classes">Import All Classes</button>
+          <button type="button" class="ddb-import-subclasses">Import All Subclasses</button>
         </div>
       </div>
     </form>
@@ -830,6 +865,7 @@ export async function runImport() {
       html.find(".ddb-import-species").on("click", () => startDdbImport("species"));
       html.find(".ddb-import-feats").on("click", () => startDdbImport("feats"));
       html.find(".ddb-import-classes").on("click", () => startDdbImport("classes"));
+      html.find(".ddb-import-subclasses").on("click", () => startDdbImport("subclasses"));
     },
     buttons: {
       run: {
