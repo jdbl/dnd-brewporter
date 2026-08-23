@@ -34,11 +34,16 @@ function sourceField(isLegacy) {
 }
 
 export async function sendDdbAuth(cobalt) {
-  const res = await fetch(`${PROXY_URL}/ddb/auth`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ cobalt }),
-  });
+  let res;
+  try {
+    res = await fetch(`${PROXY_URL}/ddb/auth`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cobalt }),
+    });
+  } catch (err) {
+    throw new Error(`Could not reach the local proxy at ${PROXY_URL} (start it with "node proxy/wikidot-proxy.mjs"): ${err.message}`);
+  }
   return res.json(); // { success, message? }
 }
 

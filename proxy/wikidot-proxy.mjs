@@ -68,6 +68,22 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${PORT}`);
   res.setHeader("Access-Control-Allow-Origin", "*");
 
+  // A plain GET with no custom headers (the /fetch and /ddb/game-data
+  // routes) never triggers a CORS preflight, so this was never needed
+  // until /ddb/auth's POST + Content-Type: application/json — a
+  // "non-simple" request — added one. Without an explicit 2xx answer to
+  // OPTIONS carrying Allow-Methods/Allow-Headers, the browser fails the
+  // preflight and blocks the real request before it's ever sent, which
+  // surfaces to calling code as a bare "Failed to fetch".
+  if (req.method === "OPTIONS") {
+    res.writeHead(204, {
+      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type",
+      "Access-Control-Max-Age": "86400",
+    }).end();
+    return;
+  }
+
   if (url.pathname === "/health") {
     res.writeHead(200, { "Content-Type": "text/plain" }).end("ok");
     return;
