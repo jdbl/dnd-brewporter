@@ -268,3 +268,162 @@ export function assembleRaceTraitItem(traitDef, raceDef) {
     raceDef.fullName,
   );
 }
+
+// ---- Classes / class features ------------------------------------------
+//
+// Unlike species traits, class features for the 12 core classes are
+// overwhelmingly likely to already exist by name in the user's installed
+// dnd5e compendiums (the system bundles the 2024 free-rules content) —
+// so this reuses importer.mjs's existing name-lookup/FIXME machinery
+// (the same one the wikidot class-import path already relies on) instead
+// of generating duplicate Feature items the way race traits do. A miss
+// still isn't a dead end: featureDetails carries DDB's own description
+// text into the "no match found" review row, so "+ Create new Feature
+// item" has real prose to start from — the wikidot class path doesn't
+// even offer that today, only its subclass path does.
+
+// DDB's ability ids are a fixed, stable enumeration used across their
+// whole API (str/dex/con/int/wis/cha = 1-6) — confirmed against this
+// account's own data (Wizard primaryAbilities/spellCastingAbilityId both
+// resolve to 4 = int).
+const ABILITY_CODE_BY_ID = { 1: "str", 2: "dex", 3: "con", 4: "int", 5: "wis", 6: "cha" };
+
+// D&D Beyond's 2014-ruleset base classes keep their original small fixed
+// ids (Bard=1 ... Rogue=12, verified against ddb-proxy's own hardcoded
+// CLASS_MAP); every 2024 version (and homebrew like Blood Hunter) uses a
+// large generated id. There's no separate isLegacy flag on a class
+// definition the way there is on races/feats, so this is the reliable
+// substitute rather than a guess.
+function isLegacyClass(classDef) {
+  return classDef.id < 1000;
+}
+
+// Warlock's multiClassSpellSlotDivisor reads 1 (same as a full caster) in
+// practice, since Pact Magic doesn't participate in normal multiclass
+// slot pooling — divisor alone can't tell them apart, so it needs the
+// same kind of name-based exception scraper.mjs already carries for
+// Artificer (PROGRESSION_OVERRIDES).
+const SPELLCASTING_NAME_OVERRIDE = { warlock: "pact", artificer: "artificer" };
+// Verified against this account's own data: Wizard/Sorcerer/Bard/Cleric/
+// Druid (full casters) all report divisor 1; Paladin/Ranger (half
+// casters) report 2. No core base class is a third-caster to verify a 3
+// against, but it follows the same documented multiclassing rule (a
+// third caster contributes a third of a caster level) so the mapping is
+// extended on that basis, not invented.
+const DIVISOR_TO_PROGRESSION = { 1: "full", 2: "half", 3: "third" };
+
+function inferSpellcastingProgression(classDef) {
+  if (!classDef.canCastSpells) return "none";
+  const override = SPELLCASTING_NAME_OVERRIDE[slugify(classDef.name)];
+  if (override) return override;
+  return DIVISOR_TO_PROGRESSION[classDef.spellRules?.multiClassSpellSlotDivisor] ?? "none";
+}
+
+export function classFolderSegments(classDef) {
+  return [classDef.name];
+}
+
+// Same per-level bucketing + name-pattern detection (Ability Score
+// Improvement, "... Subclass") that scraper.mjs's buildAdvancement uses
+// for the wikidot path, just sourced from DDB's clean classFeatures list
+// instead of a parsed prose table — so a Barbarian import produces the
+// same advancement shape whether it came from wikidot or D&D Beyond.
+// DDB repeats a feature at each level it re-triggers (a weapon mastery
+// re-pick, a later ASI) by prefixing the *name itself* with the level
+// ("8: Ability Score Improvement", "4: Weapon Mastery") rather than just
+// relying on requiredLevel — ddb-importer's own parser strips this same
+// prefix for the same reason. Left in place, it breaks both the ASI/
+// Subclass name-pattern checks below (no longer an exact match) and the
+// FIXME name-lookup (no compendium item is literally named "8: Ability
+// Score Improvement").
+const LEVEL_PREFIXED_NAME = /^\d+:\s*/;
+function cleanFeatureName(name) {
+  return name.replace(LEVEL_PREFIXED_NAME, "");
+}
+
+// A level-1 "Core <Class> Traits" entry is DDB's own summary table (primary
+// ability, hit die, saves, ...) — already captured wholesale in the class
+// item's own description, not a real granted feature.
+const CORE_TRAITS_HEADER = /^Core .+ Traits$/i;
+
+function buildClassAdvancement(classDef) {
+  const advancement = {};
+  const add = (entry) => {
+    const id = randomId();
+    advancement[id] = { _id: id, value: {}, title: "", hint: "", flags: {}, ...entry };
+  };
+  add({ type: "HitPoints", configuration: {} });
+
+  const byLevel = {};
+  for (const f of classDef.classFeatures ?? []) {
+    if (CORE_TRAITS_HEADER.test(f.name)) continue;
+    (byLevel[f.requiredLevel ?? 1] ??= []).push({ ...f, name: cleanFeatureName(f.name) });
+  }
+
+  const featureDetails = [];
+  for (const [levelStr, features] of Object.entries(byLevel)) {
+    const level = parseInt(levelStr, 10);
+    const isASI = features.some((f) => /^Ability Score Improvement$/i.test(f.name));
+    const isSubclassLevel = features.some((f) => /Subclass$/i.test(f.name) && !/^Subclass Feature$/i.test(f.name));
+    const named = features.filter((f) =>
+      !/^Ability Score Improvement$/i.test(f.name) && !/Subclass$/i.test(f.name) && !/^Subclass Feature$/i.test(f.name));
+
+    if (isSubclassLevel) add({ type: "Subclass", configuration: {}, value: { document: null, uuid: null }, level });
+    if (isASI) {
+      add({
+        type: "AbilityScoreImprovement",
+        configuration: { points: 2, fixed: { str: 0, dex: 0, con: 0, int: 0, wis: 0, cha: 0 }, cap: 2, locked: [], recommendation: null },
+        level,
+      });
+    }
+    if (named.length) {
+      add({
+        type: "ItemGrant",
+        configuration: { items: named.map((f) => ({ uuid: "", _name: `FIXME: ${f.name}`, optional: false })), optional: false, spell: null },
+        level, title: "Class Features",
+      });
+      for (const f of named) featureDetails.push({ level, name: f.name, descriptionHtml: f.description ?? "" });
+    }
+  }
+
+  return { advancement, featureDetails };
+}
+
+// Returns { item, featureDetails } — featureDetails is passed straight
+// through to importer.mjs's createItemFromData the same way a scraped
+// subclass's feature prose already is.
+export function assembleClassItem(classDef) {
+  const identifier = slugify(classDef.name);
+  const primaryAbility = ABILITY_CODE_BY_ID[classDef.primaryAbilities?.[0]];
+  const spellAbility = ABILITY_CODE_BY_ID[classDef.spellCastingAbilityId];
+  const progression = inferSpellcastingProgression(classDef);
+  const { advancement, featureDetails } = buildClassAdvancement(classDef);
+
+  return {
+    featureDetails,
+    item: {
+      _id: randomId(),
+      name: classDef.name,
+      type: "class",
+      folder: null,
+      img: `systems/dnd5e/icons/classes/${identifier}.webp`,
+      system: {
+        description: { value: classDef.description ?? "", chat: "" },
+        source: sourceField(isLegacyClass(classDef)),
+        identifier,
+        levels: 1,
+        advancement,
+        spellcasting: { progression, ability: progression !== "none" ? (spellAbility ?? "") : "", preparation: { formula: "" } },
+        primaryAbility: { value: primaryAbility ? [primaryAbility] : [], all: (classDef.primaryAbilities?.length ?? 0) <= 1 },
+        hd: { denomination: classDef.hitDice ? `d${classDef.hitDice}` : "", spent: 0, additional: "" },
+        wealth: classDef.wealthDice ?? "",
+        startingEquipment: [],
+        properties: [],
+      },
+      effects: [],
+      flags: { "dnd-brewporter": { ddbId: classDef.id, ddbSlug: classDef.slug } },
+      _stats: baseStats(),
+      ownership: { default: 0 },
+    },
+  };
+}

@@ -1,7 +1,7 @@
 import { scrapeWikidotHtml, resolveSourceUrl, isWikidotPage, assembleSubclassItem, slugify, normalizeName, searchIndex, MODULE_ID, applyRulesetPreference } from "./scraper.mjs";
 import { scrapeFreeformSubclass } from "./freeform-scraper.mjs";
 import { showBuildFeatureDialog } from "./effects-builder.mjs";
-import { sendDdbAuth, fetchDdbGameData, assembleFeatItem, usableRacialTraits, assembleRaceTraitItem, assembleRaceItem, featFolderSegments, raceTraitFolderSegments, raceFolderSegments } from "./ddb-scraper.mjs";
+import { sendDdbAuth, fetchDdbGameData, assembleFeatItem, usableRacialTraits, assembleRaceTraitItem, assembleRaceItem, featFolderSegments, raceTraitFolderSegments, raceFolderSegments, assembleClassItem, classFolderSegments } from "./ddb-scraper.mjs";
 
 // Below this many detected "Nth Level:" headings, a freeform parse is
 // shown for review before creating anything — a strong sign the doc
@@ -596,6 +596,15 @@ async function importDdbFeat(featDef, index, report) {
   await createItemFromData(assembleFeatItem(featDef), featDef.name, index, report, "ddb", undefined, featFolderSegments(featDef));
 }
 
+async function importDdbClass(classDef, index, report) {
+  try {
+    const { item, featureDetails } = assembleClassItem(classDef);
+    await createItemFromData(item, classDef.name, index, report, "ddb", featureDetails, classFolderSegments(classDef));
+  } catch (err) {
+    report.failed.push({ file: classDef.name, reason: err.message ?? String(err) });
+  }
+}
+
 async function importDdbRace(raceDef, index, report) {
   try {
     const traits = usableRacialTraits(raceDef);
@@ -631,7 +640,13 @@ async function startDdbImport(kind) {
     return;
   }
 
-  const type = kind === "feats" ? "feats" : "races";
+  const DDB_KIND_CONFIG = {
+    feats: { type: "feats", label: "feat" },
+    species: { type: "races", label: "species" },
+    classes: { type: "classes", label: "class" },
+  };
+  const { type, label } = DDB_KIND_CONFIG[kind];
+
   let items;
   try {
     items = await fetchDdbGameData(type);
@@ -640,7 +655,6 @@ async function startDdbImport(kind) {
     return;
   }
 
-  const label = kind === "feats" ? "feat" : "species";
   const proceed = await Dialog.confirm({
     title: "Brewporter Import",
     content: `<p>Ready to import ${items.length} ${label}${items.length === 1 ? "" : "s"} available on your D&D Beyond account.</p>`,
@@ -653,6 +667,7 @@ async function startDdbImport(kind) {
 
   for (const item of items) {
     if (kind === "feats") await importDdbFeat(item, index, report);
+    else if (kind === "classes") await importDdbClass(item, index, report);
     else await importDdbRace(item, index, report);
   }
 
@@ -774,6 +789,7 @@ export async function runImport() {
         <div style="display:flex; gap:4px;">
           <button type="button" class="ddb-import-species">Import All Species</button>
           <button type="button" class="ddb-import-feats">Import All Feats</button>
+          <button type="button" class="ddb-import-classes">Import All Classes</button>
         </div>
       </div>
     </form>
@@ -813,6 +829,7 @@ export async function runImport() {
       );
       html.find(".ddb-import-species").on("click", () => startDdbImport("species"));
       html.find(".ddb-import-feats").on("click", () => startDdbImport("feats"));
+      html.find(".ddb-import-classes").on("click", () => startDdbImport("classes"));
     },
     buttons: {
       run: {

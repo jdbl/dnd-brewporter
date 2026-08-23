@@ -274,12 +274,13 @@ one-way trip. **Cancel** on this step cancels creating the feature entirely.
   share a name with a player class feature) can never be offered as a
   match, a search result, or an ambiguous candidate.
 
-## D&D Beyond: Species & Feats
+## D&D Beyond: Species, Feats & Classes
 
-Alongside wikidot/homebrew class content, the importer dialog has an
-**Import All Species** / **Import All Feats** pair of buttons that pull
-directly from your D&D Beyond account — every species and feat you have
-access to (owned books, homebrew you've enabled), not just SRD content.
+Alongside wikidot/homebrew class content, the importer dialog has
+**Import All Species** / **Import All Feats** / **Import All Classes**
+buttons that pull directly from your D&D Beyond account — everything you
+have access to (owned books, homebrew you've enabled), not just SRD
+content.
 
 **One-time setup**, in addition to the local proxy above (it handles this
 too — same `node proxy/wikidot-proxy.mjs` command, no separate process):
@@ -297,14 +298,39 @@ this world's module settings, though, so don't share a world
 export/backup with it filled in if that's a concern — clear the setting
 first.
 
-Each species is created as a **Species** item filing its racial traits as
-separate Feature items into `Species/<Race Name>` (mirroring the
-`<Class>/Subclass Features` layout used elsewhere), linked via the same
-`ItemGrant` advancement classes/subclasses use. Feats land in a top-level
-**Feats** folder, one item each, with any listed prerequisite noted at the
-top of the description. Neither path runs the auto-guess effects/activities
-scan — that's still available afterward the same way as any other created
-item, by hand on the item sheet.
+**Species**: created as a **Species** item, its racial traits filed as
+separate Feature items into `Species/Traits/<Race Name>` and linked via
+`ItemGrant` advancement — this exact layout is verified against dnd5e's
+own shipped 2024 species pack, not guessed, since e.g. the
+[Actor Studio](https://foundryvtt.com/packages/foundryvtt-actor-studio)
+character creator reads a species' traits straight off that same
+`system.advancement`.
+
+**Feats**: filed into `Feats/<General|Origin|Fighting Style|Epic Boon>
+Feats` when D&D Beyond tags the category (a small minority don't come
+tagged and fall back to a flat `Feats` folder), with any prerequisite in
+the item's `Requirements` field rather than baked into the description —
+again matching the official feat pack exactly.
+
+**Classes**: filed into a `<Class Name>` folder, hit die/primary
+ability/spellcasting progression (full/half/third/pact, inferred from
+D&D Beyond's own multiclassing-divisor field, with the same kind of
+name-based exception already used for Artificer below) set directly, and
+class features linked per level via `ItemGrant`. Unlike species/feats,
+class features go through the **same name-lookup as the wikidot class
+path** — matched by name against your installed compendiums — rather than
+being freshly created, since the 12 core classes' features already exist
+there if you have the system's bundled 2024 content. A name that doesn't
+resolve lands in the normal **Problem Imports** review list, pre-seeded
+with D&D Beyond's own description text for **+ Create new Feature item**
+(the wikidot class path doesn't have text to offer there today — only its
+subclass path does). Subclasses aren't available through this yet — D&D
+Beyond's subclass data doesn't come back from the same catalog call classes
+do, and needs its own endpoint confirmed before it can be built.
+
+None of the three paths run the auto-guess effects/activities scan — that's
+still available afterward the same way as any other created item, by hand
+on the item sheet.
 
 ## Known special cases
 
