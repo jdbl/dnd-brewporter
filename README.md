@@ -173,32 +173,29 @@ the queue:
   Points"/"hit points") become a **Damage** or **Heal** activity's formula —
   attached to the guessed Save activity's damage-on-fail if one was found,
   otherwise added as its own standalone activity.
-- If the [DAE module](https://foundryvtt.com/packages/dae) ("Dynamic Effects
-  using Active Effects") is active in your world, effect-shaped language is
-  also scanned and pre-seeded as an **Effect**: "+X bonus to your AC",
-  "resistance/immunity/vulnerability to &lt;type&gt; damage", "immune to the
-  &lt;Condition&gt; condition" / "immune to being &lt;Condition&gt;" (e.g.
-  the Archfey Patron's own "Beguiling Defenses" — "You are immune to the
-  Charmed condition." — becomes a condition-immunity change, and the same
-  pattern applies to any other condition: frightened, poisoned, stunned,
-  ...), "&lt;walking/climbing/swimming/flying/burrowing&gt; speed increases
-  by X feet", and "darkvision ... X feet". DAE isn't required to use
-  effects at all — you can always build one by hand with **+ New Effect** —
-  but auto-guessing effects specifically is gated on it being active, since
-  that's what makes an attached effect reliably work end-to-end. If DAE
-  isn't active and effect-shaped language is still detected, the dialog
-  says how many were skipped and why instead of silently dropping them.
+- Effect-shaped language is also scanned and pre-seeded as an **Effect**:
+  "+X bonus to your AC", "resistance/immunity/vulnerability to
+  &lt;type&gt; damage", "immune to the &lt;Condition&gt; condition" /
+  "immune to being &lt;Condition&gt;" (e.g. the Archfey Patron's own
+  "Beguiling Defenses" — "You are immune to the Charmed condition." —
+  becomes a condition-immunity change, and the same pattern applies to any
+  other condition: frightened, poisoned, stunned, ...),
+  "&lt;walking/climbing/swimming/flying/burrowing&gt; speed increases by X
+  feet", and "darkvision ... X feet". Every one of these builds a plain
+  static-value change on an ordinary dnd5e Actor data path (e.g.
+  `system.attributes.ac.bonus`) — the same shape dnd5e's own shipped SRD
+  items use on their own effects — so it works in a stock world with no
+  other modules required; nothing here needs a roll-data formula.
   (These patterns are deliberately narrow — a feature phrasing resistance
   as a comma-separated list, e.g. "resistance to bludgeoning, piercing, and
   slashing damage", won't be picked up; add it by hand in that case.)
-- Separately from the DAE-gated changes above, a feature that grants a
-  status to whoever has it — "You have the &lt;Condition&gt; condition
-  until..." (e.g. the Archfey Patron's own "Disappearing Step" — "You have
-  the Invisible condition until the start of your next turn...") — is
-  scanned and pre-seeded as an **Effect** with that condition checked under
-  "Conditions to apply". This one always runs, DAE or not: it sets the
-  effect's own `statuses` field, a core Foundry mechanism unrelated to the
-  DAE-dependent `changes` list above.
+- A feature that grants a status to whoever has it — "You have the
+  &lt;Condition&gt; condition until..." (e.g. the Archfey Patron's own
+  "Disappearing Step" — "You have the Invisible condition until the start
+  of your next turn...") — is scanned and pre-seeded as an **Effect** with
+  that condition checked under "Conditions to apply": the effect's own
+  `statuses` field, a core Foundry mechanism separate from the `changes`
+  list above (combined into the same Effect when a feature has both).
 
 For example, importing Steps of the Fey (Archfey Patron, Level 3 — "cast
 Misty Step a number of times equal to your Charisma modifier... regain uses
@@ -274,13 +271,13 @@ one-way trip. **Cancel** on this step cancels creating the feature entirely.
   share a name with a player class feature) can never be offered as a
   match, a search result, or an ambiguous candidate.
 
-## D&D Beyond: Species, Feats, Classes & Subclasses
+## D&D Beyond: Species, Feats, Classes, Subclasses & Backgrounds
 
 Alongside wikidot/homebrew class content, the importer dialog has
 **Import All Species** / **Import All Feats** / **Import All Classes** /
-**Import All Subclasses** buttons that pull directly from your D&D Beyond
-account — everything you have access to (owned books, homebrew you've
-enabled), not just SRD content.
+**Import All Subclasses** / **Import All Backgrounds** buttons that pull
+directly from your D&D Beyond account — everything you have access to
+(owned books, homebrew you've enabled), not just SRD content.
 
 **One-time setup**, in addition to the local proxy above (it handles this
 too — same `node proxy/wikidot-proxy.mjs` command, no separate process):
@@ -310,7 +307,34 @@ character creator reads a species' traits straight off that same
 Feats` when D&D Beyond tags the category (a small minority don't come
 tagged and fall back to a flat `Feats` folder), with any prerequisite in
 the item's `Requirements` field rather than baked into the description —
-again matching the official feat pack exactly.
+again matching the official feat pack exactly. Unlike the other four
+paths, a feat's activities/effects/advancement **are** filled in
+automatically rather than left for you to build by hand:
+
+- If a same-named item already exists in one of your installed
+  compendiums (overwhelmingly the common case for real PHB feats, once
+  you have dnd5e's own bundled "D&D Modern Content" → Feats pack enabled),
+  its activities, effects, and advancement are copied over verbatim —
+  regenerated ids, otherwise untouched. This is what gets a feat mechanics
+  no amount of text-scanning would reconstruct correctly: Alert's real
+  effect is a bespoke `flags.dnd5e.initiativeAlert` change with no wording
+  in the feat text to hang a detector on; Skilled's "any combination of
+  three skills or tools" needs a `Trait` advancement, not a guessed
+  activity; Magic Initiate needs two correctly-configured `ItemChoice`
+  entries. Copying the already-correct official item sidesteps
+  re-deriving any of that from prose.
+- Only when there's no compendium match at all (homebrew, or a
+  sourcebook feat Foundry's free SRD packs don't ship) does it fall back
+  to the auto-guess scan described above, run without the review step
+  since it's D&D Beyond's own real text rather than scraped/OCR'd prose
+  (the same trust level class features already get for auto-created
+  misses) — and a feat whose text matches 2024's standardized "Ability
+  Score Increase" boilerplate (any half-feat, the flat "Ability Score
+  Improvement" feat, every Epic Boon) also gets a real
+  `AbilityScoreImprovement` advancement entry built for it this way,
+  verified against dnd5e's own shipped feat pack rather than guessed —
+  anything that doesn't match that exact phrasing is left with no
+  advancement rather than a wrong one.
 
 **Classes**: filed into a `<Class Name>` folder, hit die/primary
 ability/spellcasting progression (full/half/third/pact, inferred from
@@ -342,9 +366,28 @@ imported subclass), with its features in a `<Class Name>/Subclass
 Features` sibling folder. Features go through the same name-lookup/
 Problem-Imports path as class features.
 
-None of the four paths run the auto-guess effects/activities scan — that's
-still available afterward the same way as any other created item, by hand
-on the item sheet.
+**Backgrounds**: filed into a flat `Backgrounds` folder. D&D Beyond gives
+real structured data for exactly one part of a background — its granted
+feat (2024) or bespoke feature (2014) — everything else (skill/tool/
+language proficiencies, ability scores) only ever comes back as prose, not
+usable ids, so this doesn't guess at turning "Insight and Religion" into a
+structured grant. Instead it builds the same
+AbilityScoreImprovement/Trait/Trait/ItemGrant advancement scaffold dnd5e's
+own item sheet creates for a brand-new Background item, just pre-titled
+and pre-filled with D&D Beyond's own proficiency/language text as each
+advancement's hint — a GM still finishes each one by hand via the sheet's
+own pickers, same amount of work as starting from blank, but with the real
+text already in front of them instead of the official rulebook. A 2024
+background's granted feat goes through the same name-lookup/Problem-Imports
+path as a class feature (resolves automatically once you've run **Import
+All Feats**); a 2014 background's own bespoke feature (e.g. Acolyte's
+"Shelter of the Faithful") is built fresh as its own Feature item instead,
+filed into `Backgrounds/Background Features`, the same way a species'
+racial traits are.
+
+Species/Classes/Subclasses/Backgrounds don't run the auto-guess effects/
+activities scan (Feats do — see above); that's still available afterward
+the same way as any other created item, by hand on the item sheet.
 
 ## Known special cases
 

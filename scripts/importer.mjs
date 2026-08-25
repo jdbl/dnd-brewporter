@@ -1,7 +1,7 @@
-import { scrapeWikidotHtml, resolveSourceUrl, isWikidotPage, assembleSubclassItem, slugify, normalizeName, searchIndex, MODULE_ID, applyRulesetPreference } from "./scraper.mjs";
+import { scrapeWikidotHtml, resolveSourceUrl, isWikidotPage, assembleSubclassItem, slugify, normalizeName, searchIndex, MODULE_ID, applyRulesetPreference, randomId } from "./scraper.mjs";
 import { scrapeFreeformSubclass } from "./freeform-scraper.mjs";
-import { showBuildFeatureDialog } from "./effects-builder.mjs";
-import { sendDdbAuth, fetchDdbGameData, assembleFeatItem, usableRacialTraits, assembleRaceTraitItem, assembleRaceItem, featFolderSegments, raceTraitFolderSegments, raceFolderSegments, assembleClassItem, classFolderSegments, assembleSubclassItem as assembleDdbSubclassItem, subclassFolderSegments } from "./ddb-scraper.mjs";
+import { showBuildFeatureDialog, buildAutoMechanics } from "./effects-builder.mjs";
+import { sendDdbAuth, fetchDdbGameData, assembleFeatItem, usableRacialTraits, assembleRaceTraitItem, assembleRaceItem, featFolderSegments, raceTraitFolderSegments, raceFolderSegments, assembleClassItem, classFolderSegments, assembleSubclassItem as assembleDdbSubclassItem, subclassFolderSegments, buildDdbClassFeatureItemData, assembleBackgroundItem, assembleBackgroundFeatureItem, backgroundFolderSegments, backgroundFeatureFolderSegments } from "./ddb-scraper.mjs";
 
 // Below this many detected "Nth Level:" headings, a freeform parse is
 // shown for review before creating anything — a strong sign the doc
@@ -58,14 +58,41 @@ export function packContentKind(pack) {
   return /monster/i.test(pack.metadata.name) ? "monster" : "player";
 }
 
+// Class/subclass feature compendiums file their contents into per-class
+// folders (subclass features nested a level deeper under their base class,
+// e.g. "Fighter" > "Subclass Features" > "Champion"), so walking up to the
+// topmost ancestor recovers the owning class's name — confirmed against the
+// dnd5e system's own "classfeatures"/"classes24" packs, where e.g. every
+// class's own "Extra Attack" sits in its own class-named folder. Returns
+// null for an unfiled entry or on a Foundry build without compendium
+// folders, so callers fall back to the old unfiltered behavior rather than
+// erroring. Uses the same folderParentId-style defensive unwrap as world
+// folders above, in case a pack's folder entries are ever resolved
+// Documents rather than plain data.
+function topFolderName(pack, folderId) {
+  let currentId = folderId ?? null;
+  let name = null;
+  while (currentId) {
+    const folder = pack.folders?.get(currentId);
+    if (!folder) break;
+    name = folder.name;
+    currentId = folderParentId(folder);
+  }
+  return name;
+}
+
 export async function buildNameIndex() {
   const contentType = game.settings.get(MODULE_ID, "contentType") || "player";
-  const index = new Map(); // normalized name -> [{ uuid, name, pack, tier }]
+  const index = new Map(); // normalized name -> [{ uuid, name, pack, tier, classHint, subtype }]
   const itemPacks = game.packs.filter((p) => p.documentName === "Item" && packContentKind(p) === contentType);
   for (const pack of itemPacks) {
     let idx;
     try {
-      idx = await pack.getIndex();
+      // "system.type.subtype" is what tells a Fighting Style Feat apart
+      // from every other kind of feat (general/origin/epicBoon/...) — see
+      // resolvePoolRestriction, which needs it to resolve an ItemChoice
+      // pool placeholder without a name to look up at all.
+      idx = await pack.getIndex({ fields: ["folder", "system.type.subtype"] });
     } catch (err) {
       console.warn(`${MODULE_ID} | Could not index pack ${pack.collection}`, err);
       continue;
@@ -77,22 +104,52 @@ export async function buildNameIndex() {
       const key = normalizeName(entry.name);
       const uuid = entry.uuid ?? packUuid(pack, entry._id);
       if (!index.has(key)) index.set(key, []);
-      index.get(key).push({ uuid, name: entry.name, pack: pack.collection, tier, img: entry.img, type: entry.type });
+      index.get(key).push({
+        uuid, name: entry.name, pack: pack.collection, tier, img: entry.img, type: entry.type,
+        classHint: topFolderName(pack, entry.folder),
+        subtype: entry.system?.type?.subtype,
+      });
     }
   }
   return index;
 }
 
-function lookup(index, rawName) {
+// `expectedClass`, when given, is the class this feature is being imported
+// for (a base class name in both the class and subclass case — a subclass
+// feature is filed under its parent class's own folder). A plain name match
+// alone can't tell apart e.g. five classes' own "Extra Attack" — each is a
+// distinct compendium entry with the same name — but the compendium's own
+// folder-per-class filing can, so this is what turns most of the "N
+// matches" corrections a full class/subclass import used to generate into
+// silent auto-resolutions. Only narrows when a class-filed candidate
+// actually exists; anything unfiled or third-party falls through to the
+// original tier-only behavior untouched.
+function lookup(index, rawName, expectedClass) {
   const candidates = index.get(normalizeName(rawName));
   if (!candidates?.length) return { status: "none" };
 
   const preference = game.settings.get(MODULE_ID, "rulesetPreference");
   const pool = applyRulesetPreference(candidates, preference);
 
+  if (expectedClass) {
+    const classKey = normalizeName(expectedClass);
+    const classPool = pool.filter((c) => c.classHint && normalizeName(c.classHint) === classKey);
+    if (classPool.length) {
+      const uniqueClassUuids = new Set(classPool.map((c) => c.uuid));
+      if (uniqueClassUuids.size === 1) return { status: "resolved", match: classPool[0], classMatched: true };
+      return { status: "ambiguous", candidates: classPool, classMatched: true };
+    }
+  }
+
+  // No candidate is actually filed under the class this feature belongs
+  // to — e.g. Artificer's own "Spellcasting" against a free-SRD compendium
+  // that only ships Wizard/Cleric/etc.'s same-named feature. Those aren't
+  // interchangeable (each class's Spellcasting text/mechanics differ), so
+  // `classMatched: false` tells resolveSlot not to trust this name-only
+  // hit when it has real class-specific text to build from instead.
   const uniqueUuids = new Set(pool.map((c) => c.uuid));
-  if (uniqueUuids.size === 1) return { status: "resolved", match: pool[0] };
-  return { status: "ambiguous", candidates: pool };
+  if (uniqueUuids.size === 1) return { status: "resolved", match: pool[0], classMatched: false };
+  return { status: "ambiguous", candidates: pool, classMatched: false };
 }
 
 // Neither an ambiguous match (multiple compendium items share a name) nor
@@ -102,13 +159,90 @@ function lookup(index, rawName) {
 // straight back into that field instead of sending the user to the item
 // sheet by hand. Total misses still get `candidates: []`; the review UI
 // covers them with a live compendium search instead of a fixed list.
-function resolveSlot(entry, hintKey, index, report, context, path, pending, descByName) {
+//
+// `autoCreate`, when given, is only ever passed for D&D Beyond class/
+// subclass features (see resolveItemUuids/createItemFromData) — real
+// structured description HTML straight from the definition, not scraped or
+// OCR'd prose, so a true miss (nothing in any compendium at all — the
+// overwhelmingly common case for a sourcebook subclass dnd5e's free SRD
+// packs don't ship) is built immediately instead of queued for manual
+// review. See the `classMatched === false` branch below for the other case
+// this same real-text-beats-a-namesake logic covers.
+async function resolveSlot(entry, hintKey, index, report, context, path, pending, descByName, expectedClass, autoCreate) {
   if (!entry || typeof entry !== "object" || !(hintKey in entry)) return;
   const targetKey = "uuid" in entry ? "uuid" : typeof entry.key === "string" ? "key" : null;
   if (!targetKey || entry[targetKey] !== "") return;
 
   const rawName = String(entry[hintKey]).replace(/^FIXME(\s+spell)?:\s*/i, "").trim();
-  const result = lookup(index, rawName);
+  const result = lookup(index, rawName, expectedClass);
+  // Only populated for wikidot subclass features (see parseSubclassContent
+  // in scraper.mjs) and DDB class/subclass features (see resolveItemUuids)
+  // — lets the review dialog (or, for DDB, this function directly) offer a
+  // real feature built from the source's own text instead of starting from
+  // a blank item, or (below) instead of a cross-class name-only "match".
+  const descriptionHtml = descByName?.get(rawName) ?? null;
+
+  // `result.classMatched === false` (only ever set when status is
+  // "resolved" or "ambiguous" — see lookup) means every candidate found is
+  // filed under some *other* class/subclass than the one this feature
+  // belongs to — e.g. Artificer or Eldritch Knight's own "Spellcasting"
+  // only ever turning up Wizard/Cleric/etc.'s same-named but mechanically
+  // different feature, since dnd5e's free SRD packs don't ship Artificer
+  // or subclass-granted spellcasting at all. That's true whether there's
+  // one such candidate (an otherwise-unique name that would silently
+  // "resolve" with zero review) or several (an "ambiguous" pick list of
+  // equally wrong options) — neither is trustworthy enough to apply
+  // without a real check, so both funnel through the same fallback: real
+  // class-specific text (DDB's own description, or wikidot's own scraped
+  // prose) beats an unverified cross-class namesake. DDB can autoCreate
+  // that immediately; wikidot has no such silent-build path (a human
+  // always reviews a wikidot import, by design) so it queues for manual
+  // review instead, with the mismatched candidates *and* the real text
+  // both offered — never just the former, which is what let Eldritch
+  // Knight's "Spellcasting" silently point at Wizard's version before this
+  // fix. A class-matched ambiguity (several packs really do carry this
+  // class's own version, e.g. a 2014 and a 2024 copy) is unaffected —
+  // picking between multiple *real* candidates for this exact class is a
+  // judgment call a human, not this module, should make either way.
+  if (result.status !== "none" && result.classMatched === false) {
+    if (autoCreate && descriptionHtml) {
+      try {
+        const featureData = buildDdbClassFeatureItemData(
+          { name: rawName, level: autoCreate.level, descriptionHtml },
+          { isLegacy: autoCreate.isLegacy, requirements: autoCreate.requirements },
+        );
+        featureData.folder = autoCreate.folderId;
+        // Same real-DDB-text trust level as importDdbFeat's own fallback
+        // (see buildAutoMechanics) — an auto-built class/subclass feature
+        // deserves the same AC/resistance/darkvision/speed/save scan a
+        // feat already gets, not a permanently blank effects/activities set.
+        const { effects, activities, advancement } = buildAutoMechanics(descriptionHtml, index, rawName);
+        featureData.effects = effects;
+        featureData.system.activities = activities;
+        featureData.system.advancement = { ...(featureData.system.advancement ?? {}), ...advancement };
+        const created = await Item.create(featureData);
+        if (!created) throw new Error("Foundry rejected the auto-built feature's data (check the browser console for a DataModelValidationError).");
+        entry[targetKey] = created.uuid;
+        report.created.push({ name: created.name, uuid: created.uuid, file: context, via: "ddb-auto" });
+        delete entry[hintKey];
+        return;
+      } catch (err) {
+        console.warn(`${MODULE_ID} | Could not auto-create feature "${rawName}" — falling back to manual review`, err);
+      }
+    }
+    const candidates = result.status === "ambiguous" ? result.candidates : [result.match];
+    const packs = [...new Set(candidates.map((c) => c.pack))].join(", ");
+    pending.push({
+      context, name: rawName,
+      reason: `${candidates.length} match${candidates.length === 1 ? "" : "es"} (${packs}) — none filed under this class, may be a different class's version`,
+      path: `${path}.${targetKey}`,
+      candidates: candidates.map((c) => ({ uuid: c.uuid, name: c.name, pack: c.pack, img: c.img, type: c.type })),
+      descriptionHtml,
+    });
+    delete entry[hintKey];
+    return;
+  }
+
   if (result.status === "resolved") {
     entry[targetKey] = result.match.uuid;
     report.resolved.push({ context, name: rawName, pack: result.match.pack });
@@ -120,43 +254,130 @@ function resolveSlot(entry, hintKey, index, report, context, path, pending, desc
       candidates: result.candidates.map((c) => ({ uuid: c.uuid, name: c.name, pack: c.pack, img: c.img, type: c.type })),
     });
   } else {
+    if (autoCreate && descriptionHtml) {
+      try {
+        const featureData = buildDdbClassFeatureItemData(
+          { name: rawName, level: autoCreate.level, descriptionHtml },
+          { isLegacy: autoCreate.isLegacy, requirements: autoCreate.requirements },
+        );
+        featureData.folder = autoCreate.folderId;
+        // Same real-DDB-text trust level as importDdbFeat's own fallback
+        // (see buildAutoMechanics) — an auto-built class/subclass feature
+        // deserves the same AC/resistance/darkvision/speed/save scan a
+        // feat already gets, not a permanently blank effects/activities set.
+        const { effects, activities, advancement } = buildAutoMechanics(descriptionHtml, index, rawName);
+        featureData.effects = effects;
+        featureData.system.activities = activities;
+        featureData.system.advancement = { ...(featureData.system.advancement ?? {}), ...advancement };
+        const created = await Item.create(featureData);
+        if (!created) throw new Error("Foundry rejected the auto-built feature's data (check the browser console for a DataModelValidationError).");
+        entry[targetKey] = created.uuid;
+        report.created.push({ name: created.name, uuid: created.uuid, file: context, via: "ddb-auto" });
+        delete entry[hintKey];
+        return;
+      } catch (err) {
+        console.warn(`${MODULE_ID} | Could not auto-create feature "${rawName}" — falling back to manual review`, err);
+      }
+    }
     pending.push({
       context, name: rawName, reason: "no match found",
       path: `${path}.${targetKey}`,
       candidates: [],
-      // Only populated for wikidot subclass features (see parseSubclassContent
-      // in scraper.mjs) — lets the review dialog offer "create a new feature"
-      // with the real scraped text instead of starting from a blank item.
-      descriptionHtml: descByName?.get(rawName) ?? null,
+      descriptionHtml,
     });
   }
   delete entry[hintKey];
 }
 
+// A `{ uuid: "", _poolRestriction: { type, subtype } }` placeholder (see
+// ddb-scraper.mjs's CHOICE_FEATURE_POOL_RESTRICTION) means "every
+// compendium Feat matching this type+subtype" — an ItemChoice's whole pool
+// at once, not a single named lookup, so it can't go through resolveSlot's
+// one-field-in, one-uuid-out flow. `applyRulesetPreference` still applies
+// per name-group first, so a 2014/2024 same-name duplicate only
+// contributes its preferred version to the pool, same as a normal lookup.
+function resolvePoolRestriction(index, restriction) {
+  const preference = game.settings.get(MODULE_ID, "rulesetPreference");
+  const seen = new Set();
+  const matches = [];
+  for (const candidates of index.values()) {
+    for (const c of applyRulesetPreference(candidates, preference)) {
+      if (c.type === restriction.type && c.subtype === restriction.subtype && !seen.has(c.uuid)) {
+        seen.add(c.uuid);
+        matches.push(c);
+      }
+    }
+  }
+  return matches;
+}
+
 // Walks exactly the two shapes the scraper produces — it does not blindly
 // recurse the whole document, so it can't accidentally touch unrelated
-// fields.
-function resolveItemUuids(data, index, report, pending, featureDetails = []) {
+// fields. `featuresFolderSegments`, when given (DDB class/subclass imports
+// only — see createItemFromData), both enables auto-creation of true misses
+// and says where the built items should be filed.
+async function resolveItemUuids(data, index, report, pending, featureDetails = [], expectedClass, featuresFolderSegments) {
   const contextBase = data.name ?? "(unnamed item)";
 
-  (data.system?.startingEquipment ?? []).forEach((entry, i) => {
-    resolveSlot(entry, "_item", index, report, `${contextBase} — starting equipment`, `system.startingEquipment.${i}`, pending);
-  });
+  for (const [i, entry] of (data.system?.startingEquipment ?? []).entries()) {
+    await resolveSlot(entry, "_item", index, report, `${contextBase} — starting equipment`, `system.startingEquipment.${i}`, pending, undefined, expectedClass);
+  }
+
+  // Read off the parent item's own source rather than threaded as a
+  // separate parameter — assembleClassItem/assembleSubclassItem already
+  // set this correctly (sourceField(isLegacyClass(...))), and an
+  // auto-built feature should always match whatever ruleset its own
+  // class/subclass item is.
+  const isLegacy = data.system?.source?.rules === "2014";
+  const featuresFolderId = featuresFolderSegments ? await resolveFolderPath(featuresFolderSegments) : null;
 
   for (const [advKey, adv] of Object.entries(data.system?.advancement ?? {})) {
+    const label = `${contextBase} — level ${adv.level ?? "?"} (${adv.title || adv.type})`;
+
+    if (adv.type === "ItemChoice") {
+      const pool = adv.configuration?.pool;
+      const restriction = pool?.length === 1 ? pool[0]._poolRestriction : null;
+      if (restriction) {
+        const matches = resolvePoolRestriction(index, restriction);
+        if (matches.length) {
+          adv.configuration.pool = matches.map((m) => ({ uuid: m.uuid }));
+          report.resolved.push({ context: label, name: `${adv.title} options`, pack: `${matches.length} feat(s) found` });
+        } else {
+          adv.configuration.pool = [];
+          report.warnings.push({
+            context: label,
+            reason: `No "${restriction.subtype}" feats found in any compendium — this choice has nothing to pick from yet. Import Feats first, or fill in this advancement's pool by hand on the item sheet.`,
+          });
+        }
+      }
+      continue;
+    }
+
     const items = adv.configuration?.items;
     if (!Array.isArray(items)) continue;
-    const label = `${contextBase} — level ${adv.level ?? "?"} (${adv.title || adv.type})`;
     const descByName = new Map(featureDetails.filter((f) => f.level === adv.level).map((f) => [f.name, f.descriptionHtml]));
-    items.forEach((entry, i) => {
-      resolveSlot(entry, "_name", index, report, label, `system.advancement.${advKey}.configuration.items.${i}`, pending, descByName);
-    });
+    const autoCreate = featuresFolderSegments ? {
+      folderId: featuresFolderId,
+      isLegacy,
+      level: adv.level,
+      requirements: `${expectedClass ?? contextBase}${adv.level ? ` ${adv.level}` : ""}`,
+    } : undefined;
+    for (const [i, entry] of items.entries()) {
+      await resolveSlot(entry, "_name", index, report, label, `system.advancement.${advKey}.configuration.items.${i}`, pending, descByName, expectedClass, autoCreate);
+    }
   }
 }
 
-async function createItemFromData(data, label, index, report, via, featureDetails, className) {
+async function createItemFromData(data, label, index, report, via, featureDetails, className, featuresFolderSegments) {
   const pending = [];
-  resolveItemUuids(data, index, report, pending, featureDetails);
+  // className doubles as the folder-placement path (e.g. ["Warlock",
+  // "Subclass Features"]) and, via its first segment, the base class name
+  // to scope ambiguous feature-name lookups against (see lookup's
+  // expectedClass) — both a class and a subclass file under their base
+  // class's own name. Not a class name for feat/species imports, but a
+  // hint that never matches any class folder is simply never used.
+  const expectedClass = Array.isArray(className) ? className[0] : className;
+  await resolveItemUuids(data, index, report, pending, featureDetails, expectedClass, featuresFolderSegments);
   delete data._id;
   // A subclass's own item goes straight into its class's folder (e.g.
   // "Warlock") — matching the layout of the official class/subclass
@@ -433,22 +654,27 @@ function showProblemImportsDialog(report, index) {
     <div class="wikidot-problem-row" data-problem-index="${i}">
       <div class="wikidot-problem-header">
         ${entry.candidates.length
-          ? `<span class="wikidot-badge wikidot-badge-ambiguous">${entry.candidates.length} matches</span>`
+          ? `<span class="wikidot-badge wikidot-badge-ambiguous">${entry.candidates.length} match${entry.candidates.length === 1 ? "" : "es"}</span>`
           : `<span class="wikidot-badge wikidot-badge-none">No match</span>`}
         <strong>${entry.name}</strong>
         <em>${entry.context}</em>
       </div>
       <div class="wikidot-problem-candidates">
-        ${entry.candidates.length
-          ? entry.candidates.map(candidateCardHtml).join("")
-          : `<input type="text" class="wikidot-search-input" value="${entry.name}" placeholder="Search compendiums for a match…">
-             <div class="wikidot-search-results"></div>
-             <div class="wikidot-create-feature-row">
+        ${entry.candidates.length ? entry.candidates.map(candidateCardHtml).join("") : ""}
+        ${entry.candidates.length && entry.descriptionHtml
+          ? `<p><em>None of these are confirmed to belong to this class/subclass — they just share the name. Consider creating a new item from the source's own text below instead.</em></p>`
+          : ""}
+        ${entry.candidates.length ? "" : `
+             <input type="text" class="wikidot-search-input" value="${entry.name}" placeholder="Search compendiums for a match…">
+             <div class="wikidot-search-results"></div>`}
+        ${!entry.candidates.length || entry.descriptionHtml
+          ? `<div class="wikidot-create-feature-row">
                <button type="button" class="wikidot-create-feature">+ Create new Feature item</button>
                <em>${entry.descriptionHtml
                  ? "uses the description text scraped from the source page"
                  : "no description text was found on the page — edit it after creating"}</em>
-             </div>`}
+             </div>`
+          : ""}
       </div>
     </div>
   `;
@@ -557,6 +783,7 @@ function showReport(report, index) {
         "Couldn't fetch at all (CORS blocked it, and the local proxy wasn't reachable) — save these pages locally and re-run",
         report.manualSaveNeeded.map((u) => `<a href="${u}" target="_blank" rel="noopener">${u}</a>`)
       )}
+      ${section("Needs attention", (report.warnings ?? []).map((w) => `<em>${w.context}</em> — ${w.reason}`))}
       ${section("Failed to import", report.failed.map((f) => `${f.file} — ${f.reason}`))}
     </div>
   `;
@@ -592,14 +819,71 @@ async function ensureDdbAuth() {
   if (!result.success) throw new Error(`D&D Beyond auth failed: ${result.message ?? "unknown error"}`);
 }
 
+// D&D Beyond's own feat text is real, but the *mechanics* behind it are
+// frequently things no amount of prose-scanning recovers correctly — Alert's
+// initiative bonus is a bespoke `flags.dnd5e.initiativeAlert` change with no
+// wording in the feat text to hang a detector off of, Skilled's "any
+// combination of three skills or tools" needs a Trait advancement (not a
+// guessed activity), Magic Initiate's two-tier spell choice needs two
+// correctly-configured ItemChoice entries. dnd5e's own shipped feats24 pack
+// (the "D&D Modern Content" compendium folder) already has every core-book
+// 2024 feat built exactly right by hand — reusing that beats re-deriving it
+// from scratch whenever the name matches unambiguously. Returns true (and
+// overwrites `item`'s effects/activities/advancement in place) when a match
+// was copied; false when there's nothing to copy from, so the caller knows
+// to fall back to the prose-based guess.
+async function copyOfficialFeatMechanics(item, index, report) {
+  const match = lookup(index, item.name);
+  if (match.status !== "resolved" || match.match.type !== "feat") return false;
+
+  const source = (await fromUuid(match.match.uuid))?.toObject();
+  if (!source) return false;
+
+  item.effects = (source.effects ?? []).map((e) => ({ ...e, _id: randomId() }));
+  item.system.activities = Object.fromEntries(
+    Object.values(source.system?.activities ?? {}).map((a) => { const id = randomId(); return [id, { ...a, _id: id }]; })
+  );
+  item.system.advancement = Object.fromEntries(
+    Object.values(source.system?.advancement ?? {}).map((a) => { const id = randomId(); return [id, { ...a, _id: id }]; })
+  );
+  if (source.img && source.img !== "icons/svg/upgrade.svg") item.img = source.img;
+
+  report.resolved.push({ context: item.name, name: "activities/effects/advancement", pack: `copied from ${match.match.pack}` });
+  return true;
+}
+
 async function importDdbFeat(featDef, index, report) {
-  await createItemFromData(assembleFeatItem(featDef), featDef.name, index, report, "ddb", undefined, featFolderSegments(featDef));
+  try {
+    const item = assembleFeatItem(featDef);
+    const copied = await copyOfficialFeatMechanics(item, index, report);
+    if (!copied) {
+      // No official item to copy from (homebrew, or a sourcebook feat
+      // Foundry's free SRD packs don't ship) — fall back to scanning D&D
+      // Beyond's own description text. See buildAutoMechanics for why this
+      // is safe to apply without a review step (real DDB text, same trust
+      // level as an auto-built class feature), and why unmatched named
+      // sub-options are dropped rather than kept as blank stubs here.
+      const { effects, activities, advancement } = buildAutoMechanics(item.system.description.value, index, item.name);
+      item.effects = effects;
+      item.system.activities = activities;
+      item.system.advancement = { ...item.system.advancement, ...advancement };
+    }
+    await createItemFromData(item, featDef.name, index, report, "ddb", undefined, featFolderSegments(featDef));
+  } catch (err) {
+    report.failed.push({ file: featDef.name, reason: err.message ?? String(err) });
+  }
 }
 
 async function importDdbClass(classDef, index, report) {
   try {
     const { item, featureDetails } = assembleClassItem(classDef);
-    await createItemFromData(item, classDef.name, index, report, "ddb", featureDetails, classFolderSegments(classDef));
+    // A sibling "Class Features" folder for anything auto-built from a
+    // true miss (see resolveItemUuids) — parallel to subclasses' own
+    // "Subclass Features" convention below, not the class item's own
+    // folder (classFolderSegments), so built features don't clutter the
+    // top level next to the class item itself.
+    const featuresFolder = [...classFolderSegments(classDef), "Class Features"];
+    await createItemFromData(item, classDef.name, index, report, "ddb", featureDetails, classFolderSegments(classDef), featuresFolder);
   } catch (err) {
     report.failed.push({ file: classDef.name, reason: err.message ?? String(err) });
   }
@@ -613,6 +897,14 @@ async function importDdbRace(raceDef, index, report) {
     for (const trait of traits) {
       const data = assembleRaceTraitItem(trait, raceDef);
       data.folder = traitsFolder;
+      // Real D&D Beyond trait text (Darkvision, Dwarven Resilience-style
+      // resistances, speed increases, ...) — same trust level buildAutoMechanics
+      // already applies to a feat's description, so a racial trait gets the
+      // same scan instead of a permanently empty effects/activities set.
+      const { effects, activities, advancement } = buildAutoMechanics(data.system.description.value, index, data.name);
+      data.effects = effects;
+      data.system.activities = activities;
+      data.system.advancement = { ...(data.system.advancement ?? {}), ...advancement };
       const created = await Item.create(data);
       if (!created) throw new Error(`Foundry rejected trait "${trait.name}"'s data (check the browser console for a DataModelValidationError).`);
       report.created.push({ name: created.name, uuid: created.uuid, file: `${raceDef.fullName} (trait)`, via: "ddb" });
@@ -625,10 +917,44 @@ async function importDdbRace(raceDef, index, report) {
   }
 }
 
+async function importDdbBackground(backgroundDef, index, report) {
+  try {
+    // Only a 2014-ruleset background (featureIsFeat: false) has a bespoke
+    // feature to build — a 2024 background's origin feat is real catalog
+    // content instead, resolved by FIXME name-lookup inside
+    // assembleBackgroundItem/createItemFromData like any other DDB feature
+    // reference (see ddb-scraper.mjs's buildBackgroundAdvancement).
+    let featureUuid;
+    if (!backgroundDef.featureIsFeat && backgroundDef.featureName) {
+      const data = assembleBackgroundFeatureItem(backgroundDef);
+      data.folder = await resolveFolderPath(backgroundFeatureFolderSegments());
+      // Same real-DDB-text trust level as a feat/race trait — see
+      // buildAutoMechanics.
+      const { effects, activities, advancement } = buildAutoMechanics(data.system.description.value, index, data.name);
+      data.effects = effects;
+      data.system.activities = activities;
+      data.system.advancement = { ...(data.system.advancement ?? {}), ...advancement };
+      const created = await Item.create(data);
+      if (!created) throw new Error(`Foundry rejected the background feature "${backgroundDef.featureName}"'s data (check the browser console for a DataModelValidationError).`);
+      report.created.push({ name: created.name, uuid: created.uuid, file: `${backgroundDef.name} (feature)`, via: "ddb" });
+      featureUuid = created.uuid;
+    }
+    const item = assembleBackgroundItem(backgroundDef, featureUuid);
+    await createItemFromData(item, backgroundDef.name, index, report, "ddb", undefined, backgroundFolderSegments());
+  } catch (err) {
+    report.failed.push({ file: backgroundDef.name, reason: err.message ?? String(err) });
+  }
+}
+
 async function importDdbSubclass({ subclassDef, parentClassDef }, index, report) {
   try {
     const { item, featureDetails } = assembleDdbSubclassItem(subclassDef, parentClassDef);
-    await createItemFromData(item, subclassDef.name, index, report, "ddb", featureDetails, subclassFolderSegments(parentClassDef));
+    // subclassFolderSegments already ends in "Subclass Features" (matching
+    // the manual review dialog's own convention for a created-on-review
+    // subclass feature) — reused as-is rather than nesting another
+    // subfolder under it.
+    const featuresFolder = subclassFolderSegments(parentClassDef);
+    await createItemFromData(item, subclassDef.name, index, report, "ddb", featureDetails, featuresFolder, featuresFolder);
   } catch (err) {
     report.failed.push({ file: subclassDef.name, reason: err.message ?? String(err) });
   }
@@ -669,6 +995,7 @@ async function startDdbImport(kind) {
     species: { type: "races", label: "species" },
     classes: { type: "classes", label: "class" },
     subclasses: { label: "subclass" }, // fetched separately below — no single game-data type
+    backgrounds: { type: "backgrounds", label: "background" },
   };
   const { label } = DDB_KIND_CONFIG[kind];
 
@@ -696,12 +1023,13 @@ async function startDdbImport(kind) {
 
   ui.notifications.info("Brewporter | Indexing compendiums...");
   const index = await buildNameIndex();
-  const report = { created: [], failed: [], resolved: [], unresolved: [], manualSaveNeeded: [] };
+  const report = { created: [], failed: [], resolved: [], unresolved: [], warnings: [], manualSaveNeeded: [] };
 
   for (const item of items) {
     if (kind === "feats") await importDdbFeat(item, index, report);
     else if (kind === "classes") await importDdbClass(item, index, report);
     else if (kind === "subclasses") await importDdbSubclass(item, index, report);
+    else if (kind === "backgrounds") await importDdbBackground(item, index, report);
     else await importDdbRace(item, index, report);
   }
 
@@ -792,7 +1120,7 @@ async function startImport(urlsText, folderPath) {
   ui.notifications.info("Brewporter | Indexing compendiums...");
   const index = await buildNameIndex();
 
-  const report = { created: [], failed: [], resolved: [], unresolved: [], manualSaveNeeded: fetchFailed.map((r) => r.url) };
+  const report = { created: [], failed: [], resolved: [], unresolved: [], warnings: [], manualSaveNeeded: fetchFailed.map((r) => r.url) };
   for (const r of fetchedOk) await importFetchedPage(r.html, r.url, index, report, r.via);
   for (const file of files) await importFile(file, index, report);
 
@@ -818,13 +1146,14 @@ export async function runImport() {
         </div>
       </div>
       <div class="form-group">
-        <label>D&amp;D Beyond (your account's Species &amp; Feats)</label>
+        <label>D&amp;D Beyond (your account's content)</label>
         <p class="ddb-cobalt-status hint" style="margin:0 0 4px;"></p>
         <div style="display:flex; gap:4px;">
           <button type="button" class="ddb-import-species">Import All Species</button>
           <button type="button" class="ddb-import-feats">Import All Feats</button>
           <button type="button" class="ddb-import-classes">Import All Classes</button>
           <button type="button" class="ddb-import-subclasses">Import All Subclasses</button>
+          <button type="button" class="ddb-import-backgrounds">Import All Backgrounds</button>
         </div>
       </div>
     </form>
@@ -866,6 +1195,7 @@ export async function runImport() {
       html.find(".ddb-import-feats").on("click", () => startDdbImport("feats"));
       html.find(".ddb-import-classes").on("click", () => startDdbImport("classes"));
       html.find(".ddb-import-subclasses").on("click", () => startDdbImport("subclasses"));
+      html.find(".ddb-import-backgrounds").on("click", () => startDdbImport("backgrounds"));
     },
     buttons: {
       run: {

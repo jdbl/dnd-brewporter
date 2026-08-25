@@ -17,7 +17,7 @@
 // item's own sheet, which is the authoritative place to fine-tune anything
 // this editor doesn't cover.
 
-import { randomId, searchIndex, normalizeName, applyRulesetPreference, guessFeatureMechanics, CONDITION_WORDS, MODULE_ID } from "./scraper.mjs";
+import { randomId, searchIndex, normalizeName, applyRulesetPreference, guessFeatureMechanics, guessProficiencyAdvancement, CONDITION_WORDS, MODULE_ID } from "./scraper.mjs";
 
 function rulesetPreference() {
   return game.settings.get(MODULE_ID, "rulesetPreference");
@@ -27,16 +27,23 @@ function dnd5eConfig() {
   return (typeof CONFIG !== "undefined" && CONFIG.DND5E) || null;
 }
 
-// DAE ("Dynamic Effects using Active Effects", module id "dae") extends
-// core ActiveEffects with roll-data formulas, macro triggers, and unowned/
-// transfer-item support that vanilla core AE handling doesn't reliably
-// give you. Auto-guessed effects (see guessQueueEntries below) are gated on
-// this being active/enabled — a guessed change key like
-// "system.attributes.ac.bonus" is only worth queuing automatically when the
-// world can actually make it work end-to-end.
-function isDaeActive() {
-  return typeof game !== "undefined" && !!game.modules?.get("dae")?.active;
-}
+// Foundry v13+ moved an ActiveEffect's own mechanical data (changes,
+// duration) off the document's top level and under `system` (a real
+// TypeDataField, "base" being the only built-in subtype) — and each change
+// entry's old numeric `mode` (0-5) is now a string `type` (see
+// CONST.ACTIVE_EFFECT_CHANGE_TYPES). Verified against this world's actual
+// installed dnd5e 5.3.3 (module/documents/active-effect.mjs's own
+// #MODES_TO_TYPES table) rather than the deprecated CONST.ACTIVE_EFFECT_MODES
+// shim, which is explicitly slated for removal by v16 — a legacy top-level
+// `changes`/`mode` document a module authors today would currently still be
+// silently upgraded by Document.migrateData, but relying on a shim already
+// marked for deletion isn't a foundation worth building new code on. This
+// module's own UI keeps the old 0-5 numbers as its internal convention
+// (familiar, and every change-row's <select> already speaks it) — only the
+// read/write boundary with a real Foundry document (buildActiveEffectData,
+// activeEffectDataToPrefill) needs to translate.
+const CHANGE_TYPE_BY_MODE = { 0: "custom", 1: "multiply", 2: "add", 3: "downgrade", 4: "upgrade", 5: "override" };
+const CHANGE_MODE_BY_TYPE = Object.fromEntries(Object.entries(CHANGE_TYPE_BY_MODE).map(([mode, type]) => [type, Number(mode)]));
 
 function abilityOptions() {
   const abilities = dnd5eConfig()?.abilities ?? {
@@ -217,16 +224,26 @@ function parseActiveEffectForm(formEl) {
 }
 
 export function buildActiveEffectData(form) {
-  const duration = { startTime: null, seconds: null, combat: null, rounds: null, turns: null, startRound: null, startTurn: null };
-  if (form.durationType === "seconds") duration.seconds = form.durationValue;
-  if (form.durationType === "rounds") duration.rounds = form.durationValue;
-  if (form.durationType === "turns") duration.turns = form.durationValue;
+  // `units` stays "seconds" (the schema field's own default) even for a
+  // permanent effect — `value: null` is what actually means "no duration",
+  // matching every real dnd5e-authored effect's own permanent-duration
+  // shape (verified against dnd5e's shipped Alert feat). `expiry`/`expired`
+  // are deliberately left for the schema to fill in on create — its own
+  // default (`d => typeof d?.duration?.value === "number" ? "turnStart" : null`)
+  // already computes exactly the right value off whichever `value` is set here.
+  const duration = { value: null, units: "seconds" };
+  if (form.durationType === "seconds") duration.value = form.durationValue;
+  if (form.durationType === "rounds") { duration.value = form.durationValue; duration.units = "rounds"; }
+  if (form.durationType === "turns") { duration.value = form.durationValue; duration.units = "turns"; }
 
   return {
     _id: randomId(),
     name: form.name || "Effect",
     img: "icons/svg/aura.svg",
-    changes: form.changes.map((c) => ({ key: c.key, mode: c.mode, value: c.value, priority: null })),
+    type: "base",
+    system: {
+      changes: form.changes.map((c) => ({ key: c.key, type: CHANGE_TYPE_BY_MODE[c.mode] ?? "add", value: c.value, phase: "initial", priority: null })),
+    },
     disabled: false,
     duration,
     description: "",
@@ -241,14 +258,18 @@ export function buildActiveEffectData(form) {
 function activeEffectDataToPrefill(ae) {
   const duration = ae.duration ?? {};
   let durationType = "permanent", durationValue = "";
-  if (duration.rounds) { durationType = "rounds"; durationValue = duration.rounds; }
-  else if (duration.turns) { durationType = "turns"; durationValue = duration.turns; }
-  else if (duration.seconds) { durationType = "seconds"; durationValue = duration.seconds; }
+  if (typeof duration.value === "number") {
+    durationValue = duration.value;
+    durationType = duration.units === "rounds" || duration.units === "turns" ? duration.units : "seconds";
+  }
   return {
     name: ae.name ?? ae.label ?? "",
     transfer: ae.transfer !== false,
     durationType, durationValue,
-    changes: (ae.changes ?? []).map((c) => ({ key: c.key, mode: c.mode, value: c.value })),
+    changes: (ae.system?.changes ?? ae.changes ?? []).map((c) => ({
+      key: c.key, value: c.value,
+      mode: typeof c.mode === "number" ? c.mode : CHANGE_MODE_BY_TYPE[c.type] ?? 2,
+    })),
     statuses: [...(ae.statuses ?? [])],
   };
 }
@@ -764,16 +785,30 @@ function findExactMatch(index, name, preference) {
 // from a completely blank slate.
 //
 // Effect guesses (AC bonuses, resistances, speed, darkvision, ...) are
-// only ever queued when DAE is active (see isDaeActive) — when it isn't,
-// segments with effect-shaped hints are counted (not added) so the caller
-// can tell the user what was left out and why. Returns
-// { entries, effectHintsSkipped }.
-function guessQueueEntries(descriptionHtml, index, preference, featureName = "") {
-  if (!descriptionHtml) return { entries: [], effectHintsSkipped: 0 };
+// queued unconditionally, same as the status-hint effects below — every
+// pattern this scanner recognizes is a plain static-value "add" (or, for
+// darkvision, "upgrade") change on an ordinary dnd5e Actor data path
+// (system.attributes.ac.bonus, system.traits.dr.value, ...), exactly the
+// shape dnd5e's own shipped SRD content uses on its ActiveEffects — no
+// roll-data formula, so nothing here needs the DAE module ("Dynamic
+// Effects using Active Effects") or any other module to actually apply; it
+// works in a completely vanilla world, same as an official compendium
+// item's own effect would (verified against dnd5e's own shipped Alert
+// feat: a plain `{key: "flags.dnd5e.initiativeAlert", type: "add", value:
+// true}` change with no dependency beyond core+dnd5e).
+// `preserveUnmatchedLabels` gates the "keep a named sub-option with no
+// detected mechanics as a blank stub" fallback below. Valuable for the
+// interactive wikidot dialog (a human sees and can delete a stray stub),
+// actively wrong for D&D Beyond feats (see buildAutoMechanics) — a 2024
+// feat's own bold sub-headers are overwhelmingly plain prose bookkeeping
+// ("Repeatable.", "Spell Change.") with nothing to build, so applied
+// automatically this produced a blank "Repeatable" Utility activity on
+// every repeatable feat and similar noise elsewhere, none of which the
+// official SRD version of the same feat actually has.
+function guessQueueEntries(descriptionHtml, index, preference, featureName = "", { preserveUnmatchedLabels = true } = {}) {
+  if (!descriptionHtml) return { entries: [] };
   const { segments } = guessFeatureMechanics(descriptionHtml, index);
   const entries = [];
-  let effectHintsSkipped = 0;
-  const daeActive = isDaeActive();
 
   // Each segment keeps its own bold sub-option name (e.g. "Refreshing Step",
   // "Taunting Step") when the source text had one — carried straight into the
@@ -782,6 +817,7 @@ function guessQueueEntries(descriptionHtml, index, preference, featureName = "")
   // before this per-segment split existed.
   for (const seg of segments) {
     const name = seg.label ?? "";
+    const entriesBefore = entries.length;
     const heals = seg.diceHints.filter((d) => d.kind === "heal");
     const damages = seg.diceHints.filter((d) => d.kind === "damage");
 
@@ -821,14 +857,12 @@ function guessQueueEntries(descriptionHtml, index, preference, featureName = "")
     }
 
     // Status hints (e.g. Disappearing Step's "You have the Invisible
-    // condition") are a core-Foundry `statuses` entry, not a `changes` key —
-    // unlike the changes below, they don't need DAE, so they're queued
-    // unconditionally. When a segment carries both, they're combined into
-    // one Effect rather than two separate rows under the same label.
+    // condition") are a core-Foundry `statuses` entry, not a `changes` key.
+    // When a segment carries both, they're combined into one Effect rather
+    // than two separate rows under the same label.
     const hasStatuses = seg.statusHints?.length > 0;
     const hasChanges = seg.effectHints?.length > 0;
-    if (hasChanges && !daeActive) effectHintsSkipped++;
-    if (hasStatuses || (hasChanges && daeActive)) {
+    if (hasStatuses || hasChanges) {
       entries.push({
         kind: "effect", guessed: true,
         data: buildActiveEffectData({
@@ -836,14 +870,49 @@ function guessQueueEntries(descriptionHtml, index, preference, featureName = "")
           transfer: true,
           durationType: "permanent",
           durationValue: null,
-          changes: hasChanges && daeActive ? seg.effectHints : [],
+          changes: hasChanges ? seg.effectHints : [],
           statuses: hasStatuses ? seg.statusHints : [],
         }),
       });
     }
+
+    // A named sub-option (e.g. "Dread Resistance", "Profane Casting") whose
+    // prose didn't match any detector above would otherwise vanish from the
+    // queue with no trace — the user would never know it existed as a
+    // distinct sub-feature to build out. Preserve its name as an empty,
+    // fully-editable Utility activity rather than silently dropping it.
+    // Unlabeled (main-text) segments are left alone — every feature would
+    // otherwise get a noisy "(unnamed)" stub even when it has no sub-options.
+    if (preserveUnmatchedLabels && seg.label && entries.length === entriesBefore) {
+      entries.push({ kind: "activity", guessed: false, data: buildActivityData("utility", { name }) });
+    }
   }
 
-  return { entries, effectHintsSkipped };
+  return { entries };
+}
+
+// Entry point used by importer.mjs's D&D Beyond feat import — same
+// auto-guess detectors as showBuildFeatureDialog's pre-seeded queue below,
+// applied straight to the created item with no review dialog. A feat's own
+// `description` is real D&D Beyond text, not scraped/OCR'd prose, so it's
+// trusted at the same level buildDdbClassFeatureItemData already trusts a
+// class feature's own description — built immediately rather than queued
+// for a human to click through one at a time. Only ever runs for a feat
+// D&D Beyond has no matching official item for (see importDdbFeat) — an
+// SRD-identical feat copies its mechanics straight off the real compendium
+// item instead, so `preserveUnmatchedLabels: false` here: with no human
+// review step to catch it, a stray "Repeatable"/"Spell Change." stub isn't
+// a helpful placeholder, just noise the official item doesn't have either.
+export function buildAutoMechanics(descriptionHtml, index, featureName = "") {
+  const { entries } = guessQueueEntries(descriptionHtml, index, rulesetPreference(), featureName, { preserveUnmatchedLabels: false });
+  return {
+    effects: entries.filter((q) => q.kind === "effect").map((q) => q.data),
+    activities: Object.fromEntries(entries.filter((q) => q.kind === "activity").map((q) => [q.data._id, q.data])),
+    // Independent of the segment-based queue above (see
+    // guessProficiencyAdvancement) — a tool/skill proficiency grant like
+    // Chef's own cook's-utensils, built straight from the same trusted text.
+    advancement: guessProficiencyAdvancement(descriptionHtml),
+  };
 }
 
 // Entry point used by importer.mjs's "+ Create new Feature item" action.
@@ -854,7 +923,7 @@ function guessQueueEntries(descriptionHtml, index, preference, featureName = "")
 // entries from guessQueueEntries() instead of empty.
 export function showBuildFeatureDialog({ name, index, descriptionHtml = "" }) {
   return new Promise((resolve) => {
-    const { entries: queue, effectHintsSkipped } = guessQueueEntries(descriptionHtml, index, rulesetPreference(), name); // queue: [{kind: "effect"|"activity", data, guessed?}]
+    const { entries: queue } = guessQueueEntries(descriptionHtml, index, rulesetPreference(), name); // queue: [{kind: "effect"|"activity", data, guessed?}]
     const hadGuesses = queue.length > 0;
 
     const queueRowHtml = (item, i) => `
@@ -867,8 +936,7 @@ export function showBuildFeatureDialog({ name, index, descriptionHtml = "" }) {
     const content = `
       ${DIALOG_STYLES}
       <p>Optionally attach effects or activities to <strong>${name}</strong> before it's created. Everything stays fully editable afterward on the item sheet.</p>
-      ${hadGuesses ? `<p><em>${queue.length} item(s) below were auto-detected from the scraped text (spell references, ability modifiers, saving throws, dice) — review, edit, or remove before creating.</em></p>` : ""}
-      ${effectHintsSkipped > 0 ? `<p><em>${effectHintsSkipped} additional effect(s) (stat bonuses, resistances, speed, senses, ...) look auto-buildable but weren't added — the DAE module ("Dynamic Effects using Active Effects") isn't active in this world. Enable it to have Brewporter draft these automatically next time, or add them yourself with + New Effect.</em></p>` : ""}
+      ${hadGuesses ? `<p><em>${queue.length} item(s) below were auto-detected from the scraped text (spell references, ability modifiers, saving throws, dice, stat bonuses, resistances, speed, senses...) — review, edit, or remove before creating.</em></p>` : ""}
       <div class="wikidot-eb-actions">
         <button type="button" class="wikidot-eb-add-effect">+ New Effect</button>
         <select class="wikidot-eb-activity-type">
