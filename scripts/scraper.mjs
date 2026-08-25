@@ -209,9 +209,80 @@ function leadingBoldLabel(el) {
 // shared by every segment in guessFeatureMechanics() below so a sub-option's
 // mechanics (e.g. Refreshing Step's 1d10 Temp HP) are only ever attributed to
 // that segment, not smeared across the whole feature's text.
-function scanSegmentText(text, spellNames, index) {
+// Shared word->dnd5e movement-type key mapping, used by all three
+// walking/climbing/swimming/flying/burrowing speed detectors inside
+// scanSegmentText (delta "increases by", delta-to-target "increases to",
+// and the absolute "you have a ... speed of" grant) so the three don't each
+// repeat their own copy.
+const MOVEMENT_KEY_BY_WORD = { walking: "walk", climbing: "climb", swimming: "swim", flying: "fly", burrowing: "burrow" };
+
+// Shared guard for the self-granted-condition detector and the condition-
+// immunity detector's "immune to this ability" vs "immune to the X
+// condition" distinction inside scanSegmentText. Given the text immediately
+// preceding a matched "<condition> condition" mention (the same `before`
+// slice both detectors already compute), returns whether it reads as a
+// genuine self-grant/self-referential immunity rather than a guard clause,
+// a negated clause, a save-or-suffer clause aimed at someone else, or a
+// mention about a different subject entirely.
+//
+// Confirmed real misfires this rejects (issue 007): Athlete ("When you
+// have the Prone condition..."), Mounted Combatant ("...neither of you can
+// have the Incapacitated condition" / "...if you don't have the
+// Incapacitated condition"), Pack Fighting ("...the ally doesn't have the
+// Incapacitated condition"), Shield Master ("...cause it to have the Prone
+// condition"), Prone Fighting ("While you have the Prone condition..."),
+// and a self-referential "immune to this ability" mention sitting where a
+// condition target would be (Infernal Dragoon).
+export function isGenuineSelfGrant(before) {
+  const clause = (before ?? "").replace(/\([^)]*\)/g, "");
+
+  // A save-or-suffer clause immediately before this mention almost always
+  // targets someone else the feature affects, not its own possessor.
+  if (/\bsaving throw\b|\bspell save DC\b/i.test(clause)) return false;
+
+  // An earlier "until" feeding into this same "or" reads as one more entry
+  // in a list of ways an unrelated effect ENDS ("lasts...until X...or have
+  // the Y condition"), not a status being granted.
+  if (/\buntil\b/i.test(clause) && /\bor\s*$/i.test(clause)) return false;
+
+  // A guard/negated clause describes a condition to check FOR, not one to
+  // grant: "when/while/if you (already) have...", "doesn't/don't/can't/
+  // cannot have...", "neither...".
+  if (/\b(?:when|while|if)\s+you\s+(?:already\s+)?$/i.test(clause)) return false;
+  if (/\b(?:doesn't|don't|didn't|does not|do not|did not|can't|cannot)\s*$/i.test(clause)) return false;
+  if (/\bneither\b/i.test(clause)) return false;
+
+  // A third-party subject -- or a self-referential non-condition target
+  // like "this ability" -- immediately before the match means the
+  // condition is being applied to, or checked on, something other than the
+  // feature's own holder.
+  if (/\b(?:it|this creature|that creature|the target|the ally|your (?:mount|companion|familiar)|this\s+(?:ability|attack|effect|feature|trait)(?:'s)?)\s*(?:to\s+)?$/i.test(clause)) return false;
+
+  return true;
+}
+
+// Exported (in addition to isGenuineSelfGrant) so the self-grant/toggle-
+// grant test suite can exercise the full scanner directly against plain
+// text -- guessFeatureMechanics' own DOMParser-based HTML wrapper around
+// this function can't run outside a browser, but scanSegmentText itself
+// never touches the DOM, so it stays callable from a plain Node test.
+export function scanSegmentText(text, spellNames, index) {
   if (!spellNames.length && index) {
-    const castRe = /\bcasts?(?:ing)?\s+(?:the\s+)?((?:[A-Z][a-zA-Z']*\s*){1,4})(?:spell)?/g;
+    // Real D&D Beyond prose almost always writes spell names lowercase
+    // ("cast the misty step spell"), unlike wikidot's Title-Case class-
+    // feature text this was originally written against -- dropped the
+    // [A-Z] requirement so both styles match. The exact-match lookup below
+    // against the real compendium index (not just "looks like a name") is
+    // what actually prevents false positives on arbitrary lowercase
+    // phrases, so nothing else needs to change there -- but the repeated
+    // word group itself now needs its own guard: with lowercase words
+    // allowed, the trailing literal "spell" would otherwise get swallowed
+    // into the captured name too (e.g. "Fireball spell" as one candidate
+    // instead of "Fireball"), since the old Title-Case requirement used to
+    // stop the capture there for free. A negative lookahead keeps "spell"
+    // out of the repeated word group so the trailing `(?:spell)?` still
+    // consumes it separately, same as before this relaxation.
+    const castRe = /\bcasts?(?:ing)?\s+(?:the\s+)?((?:(?!spell\b)[A-Za-z][a-zA-Z']*\s*){1,4})(?:spell)?/g;
     let cm;
     while ((cm = castRe.exec(text))) {
       const candidate = cm[1].trim();
@@ -291,6 +362,26 @@ function scanSegmentText(text, spellNames, index) {
     ?? text.match(/(?:armor class|AC)\s+increases?\s+by\s+(\d+)/i);
   if (acMatch) effectHints.push({ key: "system.attributes.ac.bonus", mode: 2, value: acMatch[1] });
 
+  // Two narrow, literal-phrase flat mechanics with confirmed real dnd5e
+  // Active Effect keys -- dice-free, so diceRe/profRe above can't see them.
+  // Deliberately anchored to their full confirmed phrasing (not just "hit
+  // point maximum increases" or "one size larger" alone) so a one-time,
+  // non-scaling HP bonus or an unrelated size mention elsewhere doesn't
+  // misfire.
+
+  // Dwarven Toughness: "Your hit point maximum increases by 1, and it
+  // increases by 1 again whenever you gain a level." The "whenever you
+  // gain a level" anchor (required, not just "increases by N") is what
+  // distinguishes this from a flat, one-time-only HP bonus elsewhere.
+  const hpPerLevelMatch = text.match(/hit point maximum increases by (\d+)\b[^.]*\bwhenever you gain a level\b/i);
+  if (hpPerLevelMatch) effectHints.push({ key: "system.attributes.hp.bonuses.level", mode: 2, value: hpPerLevelMatch[1] });
+
+  // Powerful Build: "You count as one size larger when determining your
+  // carrying capacity..." -- a boolean flag, no number to parse.
+  if (/\bcounts?\s+as\s+one\s+size\s+larger\b[^.]*\bcarrying capacity\b/i.test(text)) {
+    effectHints.push({ key: "flags.dnd5e.powerfulBuild", mode: 2, value: true });
+  }
+
   // Captures a whole run of comma/"and"-joined words between "to" and
   // "damage" (e.g. "Bludgeoning, Piercing, and Slashing damage"), not just a
   // single type — connector words like "and" fall out naturally since
@@ -312,28 +403,47 @@ function scanSegmentText(text, spellNames, index) {
   // "immune", two different targets). Requiring adjacency to "immune" would
   // only ever catch the first item in a list like that.
   //
-  // 2024 phrasing ("the <Condition> condition"): scanned whenever the
-  // segment mentions immune/immunity anywhere, not just directly before —
-  // trades a little precision (a "<condition> condition" mention far from
-  // any immunity language in the same segment would also match) for
-  // correctly handling shared-immune lists, consistent with this scanner's
-  // "starting point for review" philosophy elsewhere.
+  // 2024 phrasing ("the <Condition> condition"): scanned sentence-by-
+  // sentence whenever the segment mentions immune/immunity anywhere, not
+  // just directly before — trades a little precision (a "<condition>
+  // condition" mention in a different sentence than any immunity language
+  // would also match) for correctly handling shared-immune lists,
+  // consistent with this scanner's "starting point for review" philosophy
+  // elsewhere. Each candidate match is run through the same
+  // isGenuineSelfGrant guard the self-granted-condition detector below
+  // uses: without it, a condition mention from an unrelated save-or-suffer
+  // clause, or a self-referential "immune to this ability" (not "the X
+  // condition") mention, gets misread as a condition-immunity grant
+  // (confirmed real misfire: Infernal Dragoon).
   if (/\bimmun(?:e|ity)\b/i.test(text)) {
+    const immunitySentences = text.match(/[^.]+\.?/g) ?? [text];
     const conditionSuffixRe = /\b([a-z]+)\s+condition\b/gi;
-    let csm;
-    while ((csm = conditionSuffixRe.exec(text))) {
-      const condition = csm[1].toLowerCase();
-      if (CONDITION_WORDS.includes(condition)) effectHints.push({ key: "system.traits.ci.value", mode: 2, value: condition });
+    for (const sentence of immunitySentences) {
+      conditionSuffixRe.lastIndex = 0;
+      let csm;
+      while ((csm = conditionSuffixRe.exec(sentence))) {
+        const condition = csm[1].toLowerCase();
+        if (!CONDITION_WORDS.includes(condition)) continue;
+        const before = sentence.slice(0, csm.index).replace(/\([^)]*\)/g, "");
+        if (!isGenuineSelfGrant(before)) continue;
+        effectHints.push({ key: "system.traits.ci.value", mode: 2, value: condition });
+      }
     }
   }
 
   // 2014 phrasing ("immune to being Charmed") has no "condition" keyword to
-  // anchor on, so this one does require direct adjacency to "immune".
+  // anchor on, so this one does require direct adjacency to "immune" — same
+  // isGenuineSelfGrant guard applied for consistency with the 2024 case
+  // above (in practice this phrasing's own "before" text is always "...
+  // immune to being ", which never trips the guard).
   const immuneBeingRe = /\bimmune\s+to\s+being\s+([a-z]+)\b/gi;
   let ibm;
   while ((ibm = immuneBeingRe.exec(text))) {
     const condition = ibm[1].toLowerCase();
-    if (CONDITION_WORDS.includes(condition)) effectHints.push({ key: "system.traits.ci.value", mode: 2, value: condition });
+    if (!CONDITION_WORDS.includes(condition)) continue;
+    const before = text.slice(0, ibm.index).replace(/\([^)]*\)/g, "");
+    if (!isGenuineSelfGrant(before)) continue;
+    effectHints.push({ key: "system.traits.ci.value", mode: 2, value: condition });
   }
 
   // Self-granted condition ("You have the Invisible condition until...",
@@ -363,6 +473,29 @@ function scanSegmentText(text, spellNames, index) {
   // start of your next turn or until you attack...or force a creature to
   // make a saving throw" — mentions "saving throw" too, just later, after
   // ending an unrelated clause about when the invisibility itself ends.
+  // A Reaction/Bonus-Action-gated grant ("you can take a Reaction to gain
+  // the Invisible condition until...", e.g. Fey Sentinel) is a genuine
+  // self-grant, but conditional on the player actually triggering it --
+  // captured separately here (built as a transfer:false toggle effect with
+  // a real duration, same shape as the shipped Stonecunning item) and
+  // excluded from the plain statusHints scan below so the same condition
+  // isn't also built as a second, permanent effect.
+  const toggleStatusHints = [];
+  const toggleGrantRe = /\byou can take a (?:reaction|bonus action) to (?:gain|give yourself)\s+(?:the\s+)?([a-z]+)\s+condition\b/gi;
+  let tgm;
+  while ((tgm = toggleGrantRe.exec(text))) {
+    const condition = tgm[1].toLowerCase();
+    if (!CONDITION_WORDS.includes(condition)) continue;
+    // "until the start of your next turn" is the confirmed real phrasing
+    // (Fey Sentinel) -- simplified to a single round rather than doing full
+    // turn-tracking, which isn't the point here; any other duration
+    // phrasing gets the same 1-round simplification rather than guessing
+    // at unfamiliar wording.
+    if (!toggleStatusHints.some((h) => h.condition === condition)) {
+      toggleStatusHints.push({ condition, durationType: "rounds", durationValue: 1 });
+    }
+  }
+
   const statusHints = [];
   if (!/\bimmun(?:e|ity)\b/i.test(text)) {
     const sentences = text.match(/[^.]+\.?/g) ?? [text];
@@ -372,24 +505,45 @@ function scanSegmentText(text, spellNames, index) {
       let gsm;
       while ((gsm = grantRe.exec(sentence))) {
         const before = sentence.slice(0, gsm.index).replace(/\([^)]*\)/g, "");
-        // A save-or-suffer clause immediately before this mention almost
-        // always targets someone else the feature affects, not its own
-        // possessor.
-        if (/\bsaving throw\b|\bspell save DC\b/i.test(before)) continue;
-        // An earlier "until" feeding into this same "or" reads as one more
-        // entry in a list of ways an unrelated effect ENDS ("lasts...until
-        // X...or have the Y condition"), not a status being granted.
-        if (/\buntil\b/i.test(before) && /\bor\s*$/i.test(before)) continue;
+        if (!isGenuineSelfGrant(before)) continue;
         const condition = gsm[1].toLowerCase();
-        if (CONDITION_WORDS.includes(condition) && !statusHints.includes(condition)) statusHints.push(condition);
+        if (!CONDITION_WORDS.includes(condition)) continue;
+        // Already captured above as a reaction/bonus-action-gated toggle
+        // grant -- don't also build a second, permanent effect for it.
+        if (toggleStatusHints.some((h) => h.condition === condition)) continue;
+        if (!statusHints.includes(condition)) statusHints.push(condition);
       }
     }
   }
 
   const speedMatch = text.match(/\b(walking|climbing|swimming|flying|burrowing)?\s*speed\s+increases?\s+by\s+(\d+)\s*feet/i);
   if (speedMatch) {
-    const movementKey = { walking: "walk", climbing: "climb", swimming: "swim", flying: "fly", burrowing: "burrow" }[(speedMatch[1] ?? "walking").toLowerCase()] ?? "walk";
+    const movementKey = MOVEMENT_KEY_BY_WORD[(speedMatch[1] ?? "walking").toLowerCase()] ?? "walk";
     effectHints.push({ key: `system.attributes.movement.${movementKey}`, mode: 2, value: speedMatch[2] });
+  }
+
+  // "Increases to N feet" is a second delta form -- a target value, not an
+  // added amount (confirmed real phrasing: Fleet of Foot's "Your base
+  // walking speed increases to 35 feet") -- so it's moded as an UPGRADE (4)
+  // rather than ADD (2), the same convention darkvision below uses for its
+  // own stated-absolute-value grant: only applies if it's better than
+  // what's already there.
+  const speedToMatch = text.match(/\b(walking|climbing|swimming|flying|burrowing)?\s*speed\s+increases?\s+to\s+(\d+)\s*feet/i);
+  if (speedToMatch) {
+    const movementKey = MOVEMENT_KEY_BY_WORD[(speedToMatch[1] ?? "walking").toLowerCase()] ?? "walk";
+    effectHints.push({ key: `system.attributes.movement.${movementKey}`, mode: 4, value: speedToMatch[2] });
+  }
+
+  // Absolute speed grant ("you have a walking/climbing/swimming/flying/
+  // burrowing speed of N feet", confirmed missing on Flight and Swim
+  // traits) -- distinct from the delta forms above (this states the whole
+  // speed outright rather than adding to or overriding an existing one),
+  // but built with the same ADD-mode shape as the "increases by" delta
+  // form above.
+  const speedAbsoluteMatch = text.match(/\byou have a (walking|climbing|swimming|flying|burrowing)\s+speed of\s+(\d+)\s*feet/i);
+  if (speedAbsoluteMatch) {
+    const movementKey = MOVEMENT_KEY_BY_WORD[speedAbsoluteMatch[1].toLowerCase()] ?? "walk";
+    effectHints.push({ key: `system.attributes.movement.${movementKey}`, mode: 2, value: speedAbsoluteMatch[2] });
   }
 
   // Two independent phrasings both grant darkvision in real D&D Beyond
@@ -402,7 +556,11 @@ function scanSegmentText(text, spellNames, index) {
   // regex alone can't catch it; trusted the same way the 2024 Ability
   // Score Increase boilerplate already is (see guessAbilityScoreImprovement)
   // since it's fixed, real official wording, not a loose guess.
-  const darkvisionMatch = text.match(/darkvision(?:\s+(?:out to|with|to|of)\s+(?:a range of\s+)?)?\s*(\d+)\s*feet/i)
+  const darkvisionMatch = text.match(/darkvision(?:\s+(?:out to|with|to|of|radius of)\s+(?:a range of\s+)?)?\s*(\d+)\s*feet/i)
+    // "Darkvision has a radius of 120 feet" (confirmed on Superior
+    // Darkvision) -- a verb+article construction the connector alternation
+    // above (prepositions only) can't reach.
+    ?? text.match(/darkvision\s+has\s+a\s+(?:radius|range)\s+of\s+(\d+)\s*feet/i)
     ?? text.match(/\bsee in dim light within\s+(\d+)\s*feet\s+of you as if it were bright light/i);
   if (darkvisionMatch) effectHints.push({ key: "system.attributes.senses.darkvision", mode: 4, value: darkvisionMatch[1] });
 
@@ -419,7 +577,10 @@ function scanSegmentText(text, spellNames, index) {
   // would repeat Draconic Flight's mistake, so nearby activation/duration
   // language suppresses the match instead of guessing wrong.
   for (const [sense, mode] of [["blindsight", 2], ["truesight", 4]]) {
-    const senseMatch = text.match(new RegExp(`\\b${sense}(?:\\s+(?:out to|with|to|of)\\s+(?:a range of\\s+)?)?\\s*(\\d+)\\s*feet`, "i"));
+    const senseMatch = text.match(new RegExp(`\\b${sense}(?:\\s+(?:out to|with|to|of|radius of)\\s+(?:a range of\\s+)?)?\\s*(\\d+)\\s*feet`, "i"))
+      // Same verb+article "has a radius/range of N feet" construction as
+      // darkvision above.
+      ?? text.match(new RegExp(`\\b${sense}\\s+has\\s+a\\s+(?:radius|range)\\s+of\\s+(\\d+)\\s*feet`, "i"));
     if (!senseMatch) continue;
     const window = 80;
     const around = text.slice(Math.max(0, senseMatch.index - window), senseMatch.index + senseMatch[0].length + window);
@@ -439,7 +600,7 @@ function scanSegmentText(text, spellNames, index) {
     return true;
   });
 
-  return { usesFormula, recoveryPeriod, savingThrow, diceHints, effectHints: dedupedEffectHints, statusHints };
+  return { usesFormula, recoveryPeriod, savingThrow, diceHints, effectHints: dedupedEffectHints, statusHints, toggleStatusHints };
 }
 
 // Best-guess mechanics scanner for a scraped feature's prose (used by the

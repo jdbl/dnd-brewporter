@@ -876,6 +876,28 @@ function guessQueueEntries(descriptionHtml, index, preference, featureName = "",
       });
     }
 
+    // Reaction/Bonus-Action-gated self-grants (e.g. Fey Sentinel's "you can
+    // take a Reaction to gain the Invisible condition until the start of
+    // your next turn") are genuine self-grants, but only while the player
+    // actually triggers the reaction -- built as their own transfer:false
+    // toggle effect with a real duration (the same shape the shipped
+    // Stonecunning item uses for its Tremorsense grant), one entry per
+    // hint, instead of folded into the permanent statuses/changes effect
+    // above.
+    for (const toggle of seg.toggleStatusHints ?? []) {
+      entries.push({
+        kind: "effect", guessed: true,
+        data: buildActiveEffectData({
+          name: name || featureName || "Effect",
+          transfer: false,
+          durationType: toggle.durationType,
+          durationValue: toggle.durationValue,
+          changes: [],
+          statuses: [toggle.condition],
+        }),
+      });
+    }
+
     // A named sub-option (e.g. "Dread Resistance", "Profane Casting") whose
     // prose didn't match any detector above would otherwise vanish from the
     // queue with no trace — the user would never know it existed as a
