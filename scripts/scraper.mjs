@@ -62,6 +62,23 @@ const TOOL_CATEGORY_WORDS = [
   [/vehicles?/i, "vehicle"],
 ];
 
+// Matches dnd5e's own CONFIG.DND5E.languages standard/exotic children keys
+// (module/config.mjs) — same "small local list" rationale as DAMAGE_TYPE_WORDS
+// above. Only covers the language names that actually show up in real
+// "speak, read, and write X" grant text; not exhaustive of every exotic/
+// primordial dialect since those never appear in that boilerplate.
+const LANGUAGE_CODES = {
+  common: "languages:standard:common", draconic: "languages:standard:draconic",
+  dwarvish: "languages:standard:dwarvish", elvish: "languages:standard:elvish",
+  giant: "languages:standard:giant", gnomish: "languages:standard:gnomish",
+  goblin: "languages:standard:goblin", halfling: "languages:standard:halfling",
+  orc: "languages:standard:orc", abyssal: "languages:exotic:abyssal",
+  celestial: "languages:exotic:celestial", "deep speech": "languages:exotic:deep",
+  druidic: "languages:exotic:druidic", infernal: "languages:exotic:infernal",
+  primordial: "languages:exotic:primordial", sylvan: "languages:exotic:sylvan",
+  undercommon: "languages:exotic:undercommon", "thieves' cant": "languages:exotic:cant",
+};
+
 // Classes where the generic full/half/third/pact heuristic can't tell the
 // difference: 2024-rules Artificer reaches the same max spell level (5th)
 // and starts at the same class level (1) as a true half-caster now that
@@ -550,17 +567,22 @@ export function guessAbilityScoreAdvancement(descriptionHtml) {
 // "You gain proficiency with cook's utensils" (the 2024 Chef feat, among
 // many others) is common enough boilerplate to reuse the exact same
 // tool-name/category parsing a class's own "Tool Proficiencies" table row
-// already goes through (parseToolProficiencies), plus a skill-name check
-// for the "proficiency in <Skill>" phrasing a feat uses instead of a
-// table. Unlike guessFeatureMechanics' effect/activity detectors (queued
-// for review — a wrong Effect could misinform play), a Trait advancement
-// is purely additive: the worst case is nothing gets detected, never a
-// wrong grant silently applied, so this is trusted at the same level
-// guessAbilityScoreAdvancement already is — built directly from real
-// feat/trait text, not queued. Kept independent of guessFeatureMechanics'
-// segment-based scan (used by the interactive Build Feature dialog too)
-// so a feat/trait imported straight from D&D Beyond gets this without
-// entangling it in that dialog's own effect/activity queue UI.
+// already goes through (parseProficiencyClause/parseToolProficiencies),
+// plus weapon/armor/skill/language vocabulary for the many other shapes a
+// feat/trait/species uses instead of a table. Unlike guessFeatureMechanics'
+// effect/activity detectors (queued for review — a wrong Effect could
+// misinform play), a Trait advancement is purely additive: the worst case
+// is nothing gets detected, never a wrong grant silently applied, so this
+// is trusted at the same level guessAbilityScoreAdvancement already is —
+// built directly from real feat/trait text, not queued. Kept independent
+// of guessFeatureMechanics' segment-based scan (used by the interactive
+// Build Feature dialog too) so a feat/trait imported straight from D&D
+// Beyond gets this without entangling it in that dialog's own
+// effect/activity queue UI.
+//
+// This function only finds proficiency/training/language-grant *clauses* in
+// the prose; parseProficiencyClause (below) owns interpreting what's inside
+// one already-isolated clause.
 export function guessProficiencyAdvancement(descriptionHtml) {
   if (!descriptionHtml) return {};
   const text = descriptionHtml.replace(/<[^>]+>/g, " ").replace(/&amp;/gi, "&").replace(/\s+/g, " ");
@@ -570,25 +592,27 @@ export function guessProficiencyAdvancement(descriptionHtml) {
   // Stops at a trailing conditional clause, not just sentence end — real
   // D&D Beyond text (e.g. Chef's own "proficiency with cook's utensils IF
   // YOU DON'T ALREADY HAVE IT") tacks one on often enough that capturing
-  // straight to the period would feed parseToolProficiencies/skillCode a
-  // string that never exact-matches any known tool/skill name.
-  const clauseRe = /\bproficiency\s+(?:with|in)\s+([^.;]+?)(?=[.;]|\s+if\b|\s+when\b|\s+unless\b|\s+provided\b|$)/gi;
+  // straight to the period would feed parseProficiencyClause a string that
+  // never exact-matches any known tool/skill name. Also triggers on "gain
+  // training with X" — the real 2024 phrasing armor grants (Heavily
+  // Armored, Moderately Armored, etc.) use instead of the word
+  // "proficiency".
+  const clauseRe = /\b(?:proficiency\s+(?:with|in)|gains?\s+training\s+with)\s+([^.;]+?)(?=[.;]|\s+if\b|\s+when\b|\s+unless\b|\s+provided\b|$)/gi;
   let cm;
   while ((cm = clauseRe.exec(text))) {
-    const clause = cm[1];
-    const { grants: toolGrants, choices: toolChoices } = parseToolProficiencies(clause);
-    grants.push(...toolGrants);
-    choices.push(...toolChoices);
-
-    // Tool names are already ruled out by parseToolProficiencies leaving no
-    // trace for a skill name — checking every comma/"and"/"or"-separated
-    // piece against SKILL_CODES too catches "proficiency in Survival and
-    // Perception" the same clause might also carry.
-    for (const piece of normalizeApostrophes(clause).split(/,\s*|\s+and\s+|\s+or\s+/i)) {
-      const code = skillCode(piece.replace(/^(?:and|or)\s+/i, "").replace(/\.$/, "").trim());
-      if (code) grants.push(`skills:${code}`);
-    }
+    const { grants: clauseGrants, choices: clauseChoices } = parseProficiencyClause(cm[1]);
+    grants.push(...clauseGrants);
+    choices.push(...clauseChoices);
   }
+
+  // The 2024 PHB's "you learn to speak, read, and write X" language-grant
+  // boilerplate (e.g. Rune Knight's Bonus Proficiencies) never contains the
+  // word "proficiency" or "training" above, so it's structurally invisible
+  // to clauseRe — it needs its own independent clause-finder feeding into
+  // the same grants list.
+  const languageRe = /\bspeak,?\s*read,?\s*(?:and|&)\s*write\s+([^.;]+?)(?=[.;]|\s+if\b|\s+when\b|\s+unless\b|\s+provided\b|$)/gi;
+  let lm;
+  while ((lm = languageRe.exec(text))) grants.push(...parseLanguageGrants(lm[1]));
 
   const uniqueGrants = [...new Set(grants)];
   if (!uniqueGrants.length && !choices.length) return {};
@@ -607,21 +631,68 @@ function abilityCode(name) {
   return ABILITY_CODES[name.trim().toLowerCase()] ?? null;
 }
 
+// Strips a leading "the" and a trailing "skill(s)" before the exact-match
+// lookup — real D&D Beyond phrasing like "proficiency in the Deception
+// skill" would otherwise never match SKILL_CODES' bare "deception" key.
 function skillCode(name) {
-  return SKILL_CODES[name.trim().toLowerCase().replace(/\.$/, "")] ?? null;
+  const cleaned = name.trim().replace(/^the\s+/i, "").replace(/\s+skills?$/i, "").replace(/\.$/, "").toLowerCase();
+  return SKILL_CODES[cleaned] ?? null;
 }
 
 function normalizeApostrophes(s) {
   return s.replace(/[‘’]/g, "'");
 }
 
+// Strips a leading "the" before the exact-match lookup — real D&D Beyond
+// phrasing like "proficiency with the Poisoner's Kit" would otherwise never
+// match TOOL_CODES' bare "poisoner's kit" key.
 function toolCode(name) {
-  const key = normalizeApostrophes(name.trim().toLowerCase()).replace(/\.$/, "");
+  const key = normalizeApostrophes(name.trim()).replace(/^the\s+/i, "").replace(/\.$/, "").toLowerCase();
   return TOOL_CODES[key] ?? null;
+}
+
+function languageCode(name) {
+  const key = normalizeApostrophes(name.trim()).replace(/^the\s+/i, "").replace(/\.$/, "").toLowerCase();
+  return LANGUAGE_CODES[key] ?? null;
+}
+
+// Reads a leading number word ("three") or digit ("3") off the front of a
+// string, e.g. for "three different Artisan's Tools of your choice" or
+// "2 skills of your choice" — returns null (not 1) when nothing numeric
+// leads the string, so callers can tell "no stated count" apart from an
+// explicit "one"/"1" and choose their own default.
+function parseCountWord(token) {
+  if (!token) return null;
+  const t = token.trim().toLowerCase();
+  if (/^\d+$/.test(t)) return parseInt(t, 10);
+  return NUMBER_WORDS[t] ?? null;
+}
+
+// e.g. "Giant" or "Giant and Draconic" -> ["languages:standard:giant", ...]
+function parseLanguageGrants(namesText) {
+  const grants = [];
+  if (!namesText) return grants;
+  const pieces = normalizeApostrophes(namesText)
+    .split(/,\s*|\s+and\s+|\s+or\s+/i)
+    .map((s) => s.replace(/^(?:and|or)\s+/i, "").trim())
+    .filter(Boolean);
+  for (const piece of pieces) {
+    const code = languageCode(piece);
+    if (code) grants.push(code);
+  }
+  return grants;
 }
 
 // e.g. "Thieves' Tools, Tinker's Tools, and one type of Artisan's Tools of
 // your choice" -> grants: ["tool:thief","tool:tinker"], choices: [{count:1,pool:["tool:art"]}]
+// A leading number word/digit on a tool-category segment ("three different
+// Artisan's Tools of your choice") sets that choice's count instead of the
+// count always defaulting to 1 (Crafter, Musician).
+//
+// Kept as its own function (rather than folded entirely into
+// parseProficiencyClause) since buildAdvancement's "Tool Proficiencies"
+// class-table row also calls this directly with a plain tool list and no
+// skill/weapon/armor/language vocabulary to consider.
 export function parseToolProficiencies(toolsText) {
   const grants = [];
   const choices = [];
@@ -635,7 +706,9 @@ export function parseToolProficiencies(toolsText) {
   for (const seg of segments) {
     const category = TOOL_CATEGORY_WORDS.find(([re]) => re.test(seg));
     if (category) {
-      choices.push({ count: 1, pool: [`tool:${category[1]}`] });
+      const leadWord = seg.match(/^(\d+|[a-z]+)\b/i);
+      const count = leadWord ? parseCountWord(leadWord[1]) : null;
+      choices.push({ count: count ?? 1, pool: [`tool:${category[1]}`] });
       continue;
     }
     const code = toolCode(seg);
@@ -643,6 +716,91 @@ export function parseToolProficiencies(toolsText) {
   }
 
   return { grants, choices };
+}
+
+// Interprets one already-isolated proficiency/training clause (the text
+// after "proficiency with/in" or "gain training with", with no surrounding
+// sentence) and returns the Trait advancement grants/choices it describes.
+// Covers, in order:
+//   1. Weapon categories (weapon:sim/mar) and armor categories
+//      (armor:lgt/med/hvy/shl) — ported from buildAdvancement's own
+//      Weapon Proficiencies/Armor Training table-row logic so the
+//      prose-based detector uses the exact same vocabulary.
+//   2. Open/unnamed "N skill(s) of your choice" and "any combination of N
+//      skills or tools of your choice" — wildcard pools (skills:*, tool:*),
+//      matching the real shape dnd5e's own Human "Skillful" trait uses.
+//   3. Tool names/categories (delegated to parseToolProficiencies).
+//   4. Skill names, with "X or Y" producing a choose-N choice (default
+//      count 1, or the clause's stated count e.g. "two of the following")
+//      and "X and Y" producing unconditional grants — plus the same
+//      leading-"the"/trailing-"skill(s)" wrapper stripping as skillCode.
+export function parseProficiencyClause(clauseRaw) {
+  const grants = [];
+  const choices = [];
+  if (!clauseRaw) return { grants, choices };
+  const clause = normalizeApostrophes(clauseRaw).trim();
+
+  // --- Weapon / armor category vocabulary (ported from buildAdvancement) --
+  if (/\bweapons?\b/i.test(clause) && (/\bsimple\b/i.test(clause) || /\bmartial\b/i.test(clause))) {
+    const weaponGrants = [];
+    if (/\bsimple\b/i.test(clause)) weaponGrants.push("weapon:sim");
+    if (/\bmartial\b/i.test(clause)) weaponGrants.push("weapon:mar");
+    return { grants: weaponGrants, choices: [] };
+  }
+  if (/\barmor\b/i.test(clause) || /\bshields?\b/i.test(clause)) {
+    const armorGrants = [];
+    if (/\blight\b/i.test(clause)) armorGrants.push("armor:lgt");
+    if (/\bmedium\b/i.test(clause)) armorGrants.push("armor:med");
+    if (/\bheavy\b/i.test(clause)) armorGrants.push("armor:hvy");
+    if (/\bshields?\b/i.test(clause)) armorGrants.push("armor:shl");
+    if (armorGrants.length) return { grants: armorGrants, choices: [] };
+  }
+
+  // --- Open/unnamed "of your choice" wildcard grants -----------------------
+  const comboMatch = clause.match(/\bany combination of\s+(\w+)\s+skills?\s+or\s+tools?\b/i);
+  if (comboMatch) {
+    return { grants: [], choices: [{ count: parseCountWord(comboMatch[1]) ?? 1, pool: ["skills:*", "tool:*"] }] };
+  }
+  const skillWildcardMatch = clause.match(/^(\w+)\s+skills?\s+of your choice\b/i);
+  if (skillWildcardMatch) {
+    return { grants: [], choices: [{ count: parseCountWord(skillWildcardMatch[1]) ?? 1, pool: ["skills:*"] }] };
+  }
+
+  // --- Tool names / categories ---------------------------------------------
+  const { grants: toolGrants, choices: toolChoices } = parseToolProficiencies(clause);
+  grants.push(...toolGrants);
+  choices.push(...toolChoices);
+
+  // --- Skill names: "or" -> choice, "and"/plain -> grants -------------------
+  let skillSection = clause;
+  let explicitCount = null;
+  const followingMatch = skillSection.match(/\b(\w+)\s+of the following(?:\s+skills?)?(?:\s+of your choice)?:?\s*/i);
+  if (followingMatch) {
+    explicitCount = parseCountWord(followingMatch[1]);
+    skillSection = skillSection.slice(followingMatch.index + followingMatch[0].length);
+  }
+  skillSection = skillSection.replace(/\(your choice\)/gi, "").replace(/\bof your choice\b/gi, "");
+
+  const hasOr = /\bor\b/i.test(skillSection);
+  const hasAnd = /\band\b/i.test(skillSection);
+  const isChoiceList = hasOr && !hasAnd;
+  const pieces = skillSection
+    .split(isChoiceList ? /,\s*|\s+or\s+/i : /,\s*|\s+and\s+/i)
+    .map((s) => s.replace(/^(?:and|or)\s+/i, "").trim())
+    .filter(Boolean);
+
+  const skillCodes = [];
+  for (const piece of pieces) {
+    const code = skillCode(piece);
+    if (code) skillCodes.push(`skills:${code}`);
+  }
+
+  if (skillCodes.length) {
+    if (isChoiceList) choices.push({ count: explicitCount ?? 1, pool: [...new Set(skillCodes)] });
+    else grants.push(...skillCodes);
+  }
+
+  return { grants: [...new Set(grants)], choices };
 }
 
 function text(el) {
