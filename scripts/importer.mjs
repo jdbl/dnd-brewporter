@@ -1,7 +1,7 @@
 import { scrapeWikidotHtml, resolveSourceUrl, isWikidotPage, assembleSubclassItem, slugify, normalizeName, searchIndex, MODULE_ID, applyRulesetPreference, randomId } from "./scraper.mjs";
 import { scrapeFreeformSubclass } from "./freeform-scraper.mjs";
 import { showBuildFeatureDialog, buildAutoMechanics } from "./effects-builder.mjs";
-import { sendDdbAuth, fetchDdbGameData, assembleFeatItem, usableRacialTraits, assembleRaceTraitItem, assembleRaceItem, featFolderSegments, raceTraitFolderSegments, raceFolderSegments, assembleClassItem, classFolderSegments, assembleSubclassItem as assembleDdbSubclassItem, subclassFolderSegments, buildDdbClassFeatureItemData, assembleBackgroundItem, assembleBackgroundFeatureItem, backgroundFolderSegments, backgroundFeatureFolderSegments } from "./ddb-scraper.mjs";
+import { sendDdbAuth, fetchDdbGameData, assembleFeatItem, usableRacialTraits, assembleRaceTraitItem, assembleRaceItem, buildSizeAdvancement, mergeTraitDerivedMovement, featFolderSegments, raceTraitFolderSegments, raceFolderSegments, assembleClassItem, classFolderSegments, assembleSubclassItem as assembleDdbSubclassItem, subclassFolderSegments, buildDdbClassFeatureItemData, assembleBackgroundItem, assembleBackgroundFeatureItem, backgroundFolderSegments, backgroundFeatureFolderSegments } from "./ddb-scraper.mjs";
 
 // Below this many detected "Nth Level:" headings, a freeform parse is
 // shown for review before creating anything — a strong sign the doc
@@ -894,9 +894,11 @@ async function importDdbRace(raceDef, index, report) {
     const traits = usableRacialTraits(raceDef);
     const traitsFolder = await resolveFolderPath(raceTraitFolderSegments(raceDef));
     const traitsByLevel = {};
+    const traitDescriptions = [];
     for (const trait of traits) {
       const data = assembleRaceTraitItem(trait, raceDef);
       data.folder = traitsFolder;
+      traitDescriptions.push(trait.description);
       // Real D&D Beyond trait text (Darkvision, Dwarven Resilience-style
       // resistances, speed increases, ...) — same trust level buildAutoMechanics
       // already applies to a feat's description, so a racial trait gets the
@@ -911,7 +913,13 @@ async function importDdbRace(raceDef, index, report) {
       const level = trait.requiredLevel ?? 0;
       (traitsByLevel[level] ??= []).push({ name: created.name, uuid: created.uuid });
     }
-    await createItemFromData(assembleRaceItem(raceDef, traitsByLevel), raceDef.fullName, index, report, "ddb", undefined, raceFolderSegments());
+    const sizeResult = buildSizeAdvancement(raceDef);
+    if (sizeResult.warning) report.warnings.push({ context: raceDef.fullName, reason: sizeResult.warning });
+    const movement = mergeTraitDerivedMovement(raceDef.weightSpeeds?.normal, traitDescriptions);
+    await createItemFromData(
+      assembleRaceItem(raceDef, traitsByLevel, { sizeAdvancement: sizeResult.advancement, movement }),
+      raceDef.fullName, index, report, "ddb", undefined, raceFolderSegments(),
+    );
   } catch (err) {
     report.failed.push({ file: raceDef.fullName, reason: err.message ?? String(err) });
   }

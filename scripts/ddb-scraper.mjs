@@ -231,9 +231,99 @@ export function buildRaceAdvancement(traitsByLevel) {
   return advancement;
 }
 
-export function assembleRaceItem(raceDef, traitsByLevel) {
+// DDB's sizeId enum, confirmed directly against live D&D Beyond API data
+// (not publicly documented anywhere) rather than guessed: 3 = Small,
+// 4 = Medium, 10 = a Small-or-Medium choice — matching the real
+// `configuration:{sizes:["sm","med"]}` shape official 2024 Human ships
+// with. Any other value is left unrecognized rather than mapped to a guess.
+const SIZE_ID_TO_DND5E = { 3: ["sm"], 4: ["med"], 10: ["sm", "med"] };
+
+// Every imported species previously got no Size advancement at all, silently
+// falling back to dnd5e's own built-in Medium default regardless of the
+// species' real size (confirmed live: Halfling, Aarakocra). Returns
+// { advancement, warning } instead of guessing on a miss: an unrecognized
+// sizeId means real size data is missing, which importer.mjs surfaces as an
+// import-report warning so a human sets it by hand instead of it silently
+// defaulting wrong.
+export function buildSizeAdvancement(raceDef) {
+  const sizes = SIZE_ID_TO_DND5E[raceDef.sizeId];
+  if (!sizes) {
+    return {
+      advancement: null,
+      warning: `Unrecognized sizeId ${raceDef.sizeId} on "${raceDef.fullName}" — no Size advancement was added; set it by hand.`,
+    };
+  }
+  const id = randomId();
+  return {
+    advancement: {
+      _id: id, type: "Size",
+      configuration: { sizes },
+      value: {}, level: 0, title: "", hint: "", flags: {},
+    },
+    warning: null,
+  };
+}
+
+// Same two confirmed real phrasings issue #013 extends scraper.mjs's own
+// sense/speed regexes with, kept as an independent copy here: this scans a
+// species' *trait* description prose to backfill the *race item's own*
+// movement object (a different merge target than scraper.mjs's
+// effects-builder pipeline, which instead turns matches into ActiveEffect
+// changes on the trait item itself).
+const ABSOLUTE_SPEED_GRANT = /\byou have an?\s+(walking|climbing|swimming|flying|burrowing)\s+speed of\s+(\d+)\s*feet/i;
+const WALKING_SPEED_INCREASES_TO = /\byour base walking speed increases to\s+(\d+)\s*feet/i;
+const SPEED_WORD_TO_MOVEMENT_KEY = { walking: "walk", climbing: "climb", swimming: "swim", flying: "fly", burrowing: "burrow" };
+
+// Some species encode a non-default speed as prose on a separately-granted
+// trait rather than in their own weightSpeeds data — confirmed live: Water
+// Genasi's race item has movement:{walk:"30"} only (no swim) but grants a
+// "Swim" trait reading "You have a swimming speed of 30 feet."; Wood Elf's
+// race item has movement.walk:"30" (the base) but grants a "Fleet of Foot"
+// trait reading "Your base walking speed increases to 35 feet." baseMovement
+// is the {walk,fly,swim,climb,burrow}-shaped object derived from
+// raceDef.weightSpeeds?.normal (or null/undefined if there was none);
+// traitDescriptions is that species' racial traits' raw HTML description
+// text. Returns a new movement object in the same shape — never mutates
+// baseMovement.
+export function mergeTraitDerivedMovement(baseMovement, traitDescriptions) {
+  const merged = { walk: null, fly: null, swim: null, climb: null, burrow: null, ...(baseMovement ?? {}) };
+
+  for (const html of traitDescriptions ?? []) {
+    const text = (html ?? "").replace(/<[^>]+>/g, " ");
+
+    const absolute = text.match(ABSOLUTE_SPEED_GRANT);
+    if (absolute) {
+      const key = SPEED_WORD_TO_MOVEMENT_KEY[absolute[1].toLowerCase()];
+      // Only fills a direction weightSpeeds didn't already set — an
+      // absolute grant ("you have a swimming speed of...") never overrides
+      // real numeric data that's already present.
+      if (key && !merged[key]) merged[key] = absolute[2];
+    }
+
+    const walkIncrease = text.match(WALKING_SPEED_INCREASES_TO);
+    if (walkIncrease) {
+      // Walking speed is very likely already set from weightSpeeds, so
+      // (unlike the absolute-grant fill-if-unset rule above) this takes
+      // whichever of the base value and the trait-derived target is higher.
+      const candidate = parseInt(walkIncrease[1], 10);
+      const current = parseInt(merged.walk, 10) || 0;
+      if (candidate > current) merged.walk = String(candidate);
+    }
+  }
+
+  return merged;
+}
+
+// `overrides.movement`, when given, is a precomputed movement object (see
+// mergeTraitDerivedMovement) that replaces the raceDef.weightSpeeds?.normal
+// derivation below wholesale — used when a caller has already merged in
+// trait-derived speed data. Omitting it falls back to today's
+// weightSpeeds-only behavior. `overrides.sizeAdvancement`, when given, is a
+// single Size advancement entry (see buildSizeAdvancement) merged in
+// alongside the racial-traits ItemGrant advancement.
+export function assembleRaceItem(raceDef, traitsByLevel, { sizeAdvancement, movement } = {}) {
   const identifier = slugify(raceDef.fullName);
-  const speed = raceDef.weightSpeeds?.normal;
+  const speed = movement !== undefined ? movement : raceDef.weightSpeeds?.normal;
 
   return {
     _id: randomId(),
@@ -245,7 +335,10 @@ export function assembleRaceItem(raceDef, traitsByLevel) {
       description: { value: raceDef.description ?? raceDef.longDescription ?? "", chat: "" },
       source: sourceField(raceDef.isLegacy),
       identifier,
-      advancement: buildRaceAdvancement(traitsByLevel),
+      advancement: {
+        ...buildRaceAdvancement(traitsByLevel),
+        ...(sizeAdvancement ? { [sizeAdvancement._id]: sizeAdvancement } : {}),
+      },
       // 5e rule (both 2014 and 2024): playable species are Humanoid unless
       // stated otherwise — DDB's creatureTypeId isn't a documented/stable
       // enum we can map confidently, so this is a deliberate, verified-safe
@@ -741,7 +834,7 @@ function buildBackgroundAdvancement(backgroundDef, featureItemUuid) {
     hint: backgroundProficiencyHint(backgroundDef),
   });
 
-  if (backgroundDef.featureIsFeat) {
+  if (backgroundDef.languagesDescription) {
     add({
       type: "Trait",
       configuration: { mode: "default", allowReplacements: false, grants: ["languages:standard:common"], choices: [] },
