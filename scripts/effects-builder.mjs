@@ -17,7 +17,7 @@
 // item's own sheet, which is the authoritative place to fine-tune anything
 // this editor doesn't cover.
 
-import { randomId, searchIndex, normalizeName, applyRulesetPreference, guessFeatureMechanics, guessProficiencyAdvancement, CONDITION_WORDS, MODULE_ID } from "./scraper.mjs";
+import { randomId, searchIndex, normalizeName, applyRulesetPreference, guessFeatureMechanics, guessProficiencyAdvancement, guessAbilityScoreAdvancement, CONDITION_WORDS, MODULE_ID } from "./scraper.mjs";
 
 function rulesetPreference() {
   return game.settings.get(MODULE_ID, "rulesetPreference");
@@ -910,8 +910,11 @@ export function buildAutoMechanics(descriptionHtml, index, featureName = "") {
     activities: Object.fromEntries(entries.filter((q) => q.kind === "activity").map((q) => [q.data._id, q.data])),
     // Independent of the segment-based queue above (see
     // guessProficiencyAdvancement) — a tool/skill proficiency grant like
-    // Chef's own cook's-utensils, built straight from the same trusted text.
-    advancement: guessProficiencyAdvancement(descriptionHtml),
+    // Chef's own cook's-utensils, plus the standard 2024 Ability Score
+    // Improvement boilerplate (guessAbilityScoreAdvancement), both built
+    // straight from the same trusted text and merged into one advancement
+    // object (independently-generated random ids, so no key collisions).
+    advancement: { ...(guessAbilityScoreAdvancement(descriptionHtml) ?? {}), ...guessProficiencyAdvancement(descriptionHtml) },
   };
 }
 
