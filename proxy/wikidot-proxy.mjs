@@ -32,7 +32,7 @@ const PORT = 8091;
 // browser. The bearer is short-lived (~5 minutes observed); this refreshes
 // it transparently using the last cobalt value it was given, so the
 // Foundry-side client never has to think about expiry.
-const DDB_GAME_DATA_TYPES = new Set(["races", "feats", "classes", "backgrounds"]);
+const DDB_GAME_DATA_TYPES = new Set(["races", "feats", "classes", "backgrounds", "subclasses"]);
 let ddbCobalt = null;
 let ddbBearer = null;
 let ddbBearerExpiresAt = 0;
@@ -67,6 +67,22 @@ async function readJsonBody(req) {
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${PORT}`);
   res.setHeader("Access-Control-Allow-Origin", "*");
+
+  // A plain GET with no custom headers (the /fetch and /ddb/game-data
+  // routes) never triggers a CORS preflight, so this was never needed
+  // until /ddb/auth's POST + Content-Type: application/json — a
+  // "non-simple" request — added one. Without an explicit 2xx answer to
+  // OPTIONS carrying Allow-Methods/Allow-Headers, the browser fails the
+  // preflight and blocks the real request before it's ever sent, which
+  // surfaces to calling code as a bare "Failed to fetch".
+  if (req.method === "OPTIONS") {
+    res.writeHead(204, {
+      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type",
+      "Access-Control-Max-Age": "86400",
+    }).end();
+    return;
+  }
 
   if (url.pathname === "/health") {
     res.writeHead(200, { "Content-Type": "text/plain" }).end("ok");
@@ -115,9 +131,19 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(400, { "Content-Type": "application/json" }).end(JSON.stringify({ success: false, message: `Unsupported type "${type}"` }));
       return;
     }
+    // "subclasses" requires baseClassId (D&D Beyond scopes it per parent
+    // class, unlike races/feats/classes/backgrounds which return everything
+    // in one call) — forwarded straight through, sharingSetting is always
+    // forced to 2 regardless of what the client sent.
+    if (type === "subclasses" && !/^\d+$/.test(url.searchParams.get("baseClassId") ?? "")) {
+      res.writeHead(400, { "Content-Type": "application/json" }).end(JSON.stringify({ success: false, message: "subclasses requires a numeric ?baseClassId=" }));
+      return;
+    }
     try {
       const bearer = await getDdbBearer();
-      const upstream = await fetch(`https://character-service.dndbeyond.com/character/v5/game-data/${type}?sharingSetting=2`, {
+      const upstreamParams = new URLSearchParams(url.search);
+      upstreamParams.set("sharingSetting", "2");
+      const upstream = await fetch(`https://character-service.dndbeyond.com/character/v5/game-data/${type}?${upstreamParams}`, {
         headers: { Authorization: `Bearer ${bearer}` },
       });
       if (upstream.status === 401) {
