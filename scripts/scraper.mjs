@@ -261,6 +261,130 @@ export function isGenuineSelfGrant(before) {
   return true;
 }
 
+// Parses an explicit "DC 8 + your Constitution modifier + your Proficiency
+// Bonus" style clause -- any term order, "+"/"plus" as connectors, "your"/
+// "the" optional -- into a dnd5e roll-data formula string like
+// "8 + @abilities.con.mod + @prof" (issue 016). Only resolves a LITERALLY
+// NAMED ability: "the ability you increased with this feat" / "your
+// spellcasting ability modifier" is a player choice with no stable
+// per-item roll-data key dnd5e exposes for "whichever ability this
+// specific feat's ASI granted", so that phrasing is deliberately left
+// unresolved here rather than guessed at -- whatever else in the clause IS
+// resolvable (e.g. just "8 + @prof") is still returned. Returns null when
+// no numeric "DC <N>" anchor is found at all, so callers can fall back to
+// their own spellcasting/flat-DC handling.
+export function parseDcFormula(text) {
+  const dcMatch = text.match(/\bDC\s*(?:of\s*)?(?:equal to\s*)?(\d+)\b/i);
+  if (!dcMatch) return null;
+
+  // Confirmed real phrasings keep every modifier term within a few words of
+  // the DC number itself -- a short window after it avoids picking up an
+  // unrelated ability/proficiency mention later in a long segment.
+  const window = text.slice(dcMatch.index, dcMatch.index + 120);
+  const terms = [];
+
+  const abilityRe = /\b(Strength|Dexterity|Constitution|Intelligence|Wisdom|Charisma)\s+modifier\b/gi;
+  let am;
+  while ((am = abilityRe.exec(window))) {
+    const code = abilityCode(am[1]);
+    if (code) terms.push({ index: am.index, text: `@abilities.${code}.mod` });
+  }
+
+  const profRe = /\bproficiency bonus\b/gi;
+  let pm;
+  while ((pm = profRe.exec(window))) terms.push({ index: pm.index, text: "@prof" });
+
+  if (!terms.length) return null;
+  terms.sort((a, b) => a.index - b.index);
+  const seen = new Set();
+  const ordered = terms.filter((t) => (seen.has(t.text) ? false : (seen.add(t.text), true)));
+  return [dcMatch[1], ...ordered.map((t) => t.text)].join(" + ");
+}
+
+// Explicit action-economy phrasing (issue 017) -- every activity guessed by
+// this scanner previously defaulted to a plain "action" with no trigger
+// condition regardless of what the prose said, which is why so many
+// generated reaction/bonus-action features (Interception, Telekinetic,
+// War Caster's Reactive Spell, ...) came out activation-type "action"
+// instead of "reaction"/"bonus". Checked in specificity order so a segment
+// that happens to mention more than one doesn't get the wrong one.
+const REACTION_PHRASE_RE = /\b(?:as|using|use|takes?)\s+(?:a|your)\s+reaction\b/i;
+const BONUS_ACTION_PHRASE_RE = /\b(?:as|using|use|takes?)\s+(?:a|your)\s+bonus action\b/i;
+const ACTION_PHRASE_RE = /\b(?:as|using|use|takes?)\s+(?:a|your|an)\s+action\b/i;
+// A leading "When X, ..." / "Immediately after X, ..." clause -- dnd5e's
+// own activation.condition field wants exactly this kind of free text.
+// Anchored to the start of the segment (real prose almost always leads
+// with its own trigger clause) rather than scanning anywhere in a long
+// segment, where an unrelated "when"/"if" elsewhere could be misattributed
+// as the activation trigger.
+const TRIGGER_CLAUSE_RE = /^\s*((?:When|Whenever|If|Immediately after)\b[^,.]+)[,.]/i;
+
+export function parseActivation(text) {
+  let type = null;
+  if (REACTION_PHRASE_RE.test(text)) type = "reaction";
+  else if (BONUS_ACTION_PHRASE_RE.test(text)) type = "bonus";
+  else if (ACTION_PHRASE_RE.test(text)) type = "action";
+
+  const triggerMatch = text.match(TRIGGER_CLAUSE_RE);
+  const condition = triggerMatch ? triggerMatch[1].trim() : "";
+  // A stated trigger with no explicit action-economy word ("Immediately
+  // after you take the Attack action, you can teleport...") is exactly
+  // what dnd5e's own "Special" activation type is for -- a triggered
+  // ability that isn't on the normal action/bonus/reaction economy.
+  if (!type && condition) type = "special";
+
+  return { type, condition };
+}
+
+// Range and target parsing (issue 017) -- confirmed against real dnd5e-
+// shipped data (Fireball for a plain range + sphere template, Bless for a
+// multi-target affects.count/type, Aura of Protection for an Emanation --
+// which dnd5e's own schema stores under template.type "radius", not
+// "emanation", despite the 2024 rules text always saying "Emanation").
+// Deliberately narrow, literal phrasings only -- same "starting point for
+// review" philosophy as the rest of this scanner, and everything built
+// from these stays fully editable on the item sheet afterward.
+const AREA_TEMPLATE_TYPE_BY_WORD = {
+  emanation: "radius", radius: "radius", sphere: "sphere", cone: "cone",
+  cube: "cube", line: "line", cylinder: "cylinder", square: "square", wall: "wall",
+};
+
+export function parseRangeAndTarget(text) {
+  let range = null;
+  const rangeMatch = text.match(/\bwithin\s+(\d+)\s*(?:feet|foot|ft\.?)\b/i);
+  if (rangeMatch) range = { value: Number(rangeMatch[1]), units: "ft" };
+
+  let target = null;
+  const areaMatch = text.match(/\b(\d+)[\s-]foot(?:-radius)?\s+(emanation|radius|sphere|cone|cube|line|cylinder|square|wall)\b/i);
+  if (areaMatch) {
+    target = { template: { type: AREA_TEMPLATE_TYPE_BY_WORD[areaMatch[2].toLowerCase()], size: areaMatch[1], units: "ft" } };
+  } else {
+    const countMatch = text.match(/\bup to\s+(\w+)\s+creatures?\b/i) ?? text.match(/\b(\w+)\s+creatures?\s+of your choice\b/i);
+    if (countMatch) {
+      const word = countMatch[1].toLowerCase();
+      const count = NUMBER_WORDS[word] ?? (/^\d+$/.test(word) ? Number(word) : null);
+      if (count) target = { affects: { type: "creature", count: String(count) } };
+    }
+  }
+
+  return { range, target };
+}
+
+// Converts a raw dice+modifier match (e.g. "1d10 + your Proficiency Bonus",
+// "2d6 + your Charisma modifier + your Proficiency Bonus") from the merged
+// diceRe above into a plain dnd5e roll-data formula string, same
+// whitespace-stripped convention the old dice-only formula already used.
+function normalizeMergedFormula(raw) {
+  return raw
+    .replace(/\bplus\b/gi, "+")
+    .replace(/(?:your\s+)?(Strength|Dexterity|Constitution|Intelligence|Wisdom|Charisma)\s+modifier/gi, (_, ability) => `@abilities.${abilityCode(ability)}.mod`)
+    .replace(/(twice|double|half|three times|triple)?\s*(?:your\s+)?proficiency bonus/gi, (_, mult) => {
+      const multiplier = { twice: "*2", double: "*2", half: "/2", "three times": "*3", triple: "*3" }[mult?.toLowerCase()] ?? "";
+      return `@prof${multiplier}`;
+    })
+    .replace(/\s+/g, "");
+}
+
 // Exported (in addition to isGenuineSelfGrant) so the self-grant/toggle-
 // grant test suite can exercise the full scanner directly against plain
 // text -- guessFeatureMechanics' own DOMParser-based HTML wrapper around
@@ -282,7 +406,20 @@ export function scanSegmentText(text, spellNames, index) {
     // stop the capture there for free. A negative lookahead keeps "spell"
     // out of the repeated word group so the trailing `(?:spell)?` still
     // consumes it separately, same as before this relaxation.
-    const castRe = /\bcasts?(?:ing)?\s+(?:the\s+)?((?:(?!spell\b)[A-Za-z][a-zA-Z']*\s*){1,4})(?:spell)?/g;
+    //
+    // "cast(s/ing)" isn't the only verb real 2024 spell-grant prose uses --
+    // "you always have the Misty Step spell prepared" (Fey Touched, Fey
+    // Sentinel's Entangle, Infernal Bulwark's Armor of Agathys, Infernal
+    // Dragoon's Magic Weapon, Shadow Touched's Invisibility, ...) never
+    // says "cast" anywhere near the spell's own name, so the old verb-only
+    // alternation missed every one of these entirely (issue 019). Widened
+    // to also match "have/has/know/knows/learn/learns" -- broader as a
+    // trigger, but the same hard index-match gate below (a candidate must
+    // be a REAL compendium spell name, not just "looks like one") is what
+    // actually prevents false positives, same as it always has for "cast":
+    // an unrelated "have the Invisible condition"-shaped sentence produces
+    // a candidate that simply isn't in the spell index and gets dropped.
+    const castRe = /\b(?:casts?(?:ing)?|have|has|know|knows|learn|learns)\s+(?:the\s+)?((?:(?!spell\b)[A-Za-z][a-zA-Z']*\s*){1,4})(?:spell)?/g;
     let cm;
     while ((cm = castRe.exec(text))) {
       const candidate = cm[1].trim();
@@ -292,6 +429,12 @@ export function scanSegmentText(text, spellNames, index) {
     }
   }
 
+  const srIdx = text.search(/\bshort rest\b/i);
+  const lrIdx = text.search(/\blong rest\b/i);
+  let recoveryPeriod = null;
+  if (srIdx !== -1 && (lrIdx === -1 || srIdx < lrIdx)) recoveryPeriod = "sr";
+  else if (lrIdx !== -1) recoveryPeriod = "lr";
+
   let usesFormula = null;
   const modMatch = text.match(/\b(Strength|Dexterity|Constitution|Intelligence|Wisdom|Charisma)\s+modifier\b/i);
   if (modMatch) {
@@ -299,34 +442,83 @@ export function scanSegmentText(text, spellNames, index) {
   } else {
     const numRe = new RegExp(`\\b(${Object.keys(NUMBER_WORDS).join("|")})\\s+times?\\b`, "i");
     const numMatch = text.match(numRe);
-    if (numMatch) usesFormula = String(NUMBER_WORDS[numMatch[1].toLowerCase()]);
+    if (numMatch) {
+      usesFormula = String(NUMBER_WORDS[numMatch[1].toLowerCase()]);
+    } else if (recoveryPeriod) {
+      // Bare "once"/"twice" (no "times" suffix) is the far more common D&D
+      // Beyond phrasing for a rest-recovered single/double use ("usable
+      // once per long rest") -- gated on an actual short/long-rest mention
+      // already found above so an unrelated temporal "once" ("once you
+      // reach 5th level") doesn't misfire into a spurious limited-use
+      // resource on a segment that just happens to also mention a rest.
+      const onceTwiceMatch = text.match(/\b(once|twice)\b/i);
+      if (onceTwiceMatch) usesFormula = onceTwiceMatch[1].toLowerCase() === "once" ? "1" : "2";
+    }
   }
-
-  const srIdx = text.search(/\bshort rest\b/i);
-  const lrIdx = text.search(/\blong rest\b/i);
-  let recoveryPeriod = null;
-  if (srIdx !== -1 && (lrIdx === -1 || srIdx < lrIdx)) recoveryPeriod = "sr";
-  else if (lrIdx !== -1) recoveryPeriod = "lr";
 
   let savingThrow = null;
   const saveMatch = text.match(/\b(Strength|Dexterity|Constitution|Intelligence|Wisdom|Charisma)\s+saving throw\b/i);
   if (saveMatch) {
+    const dcSpellcasting = /spell save DC/i.test(text);
     savingThrow = {
       ability: abilityCode(saveMatch[1]),
-      dcSpellcasting: /spell save DC/i.test(text),
+      dcSpellcasting,
+      dcFormula: dcSpellcasting ? null : parseDcFormula(text),
       onSaveHalf: /half\s*(?:as much|the)?\s*damage/i.test(text),
     };
   }
 
   const diceHints = [];
-  const diceRe = /(\d+d\d+(?:\s*[+-]\s*\d+)?)\s+([A-Za-z][A-Za-z ]{0,25}?)(?=[.,;]|\s+(?:and|or)\b|$)/gi;
+  // Ranges (as [start, end) character offsets into `text`) already fully
+  // accounted for by a merged dice+modifier formula below -- profRe further
+  // down skips any match inside one of these so the same "proficiency
+  // bonus" mention doesn't also produce a second, redundant flat hint.
+  const consumedRanges = [];
+
+  // A dice term optionally chained with one or more "+ <modifier>" clauses
+  // -- a literal number, an ability-modifier phrase, or a proficiency-bonus
+  // phrase (with an optional multiplier word) -- merged into ONE combined
+  // roll-data formula (issue 017) instead of the dice half and the
+  // modifier half being seen as two unrelated, independently-classified
+  // hints. Confirmed real misfire this fixes: Interception's "1d10 + your
+  // Proficiency Bonus" previously matched neither half correctly -- the
+  // old dice-only regex required a literal numeric modifier right after
+  // the dice term and simply failed to match the whole clause once a text
+  // term followed the "+", silently dropping the die and leaving only the
+  // flat "@prof" hint from profRe below.
+  const MODIFIER_TERM = "(?:\\d+|(?:your\\s+)?(?:Strength|Dexterity|Constitution|Intelligence|Wisdom|Charisma)\\s+modifier|(?:twice|double|half|three times|triple)?\\s*(?:your\\s+)?proficiency bonus)";
+  const diceRe = new RegExp(`(\\d+d\\d+(?:\\s*(?:\\+|plus)\\s*${MODIFIER_TERM})*)\\s+([A-Za-z][A-Za-z ]{0,25}?)(?=[.,;]|\\s+(?:and|or)\\b|$)`, "gi");
   let dm;
   while ((dm = diceRe.exec(text))) {
-    const formula = dm[1].replace(/\s+/g, "");
+    const formula = normalizeMergedFormula(dm[1]);
     const context = dm[2].trim().toLowerCase();
+    consumedRanges.push([dm.index, dm.index + dm[1].length]);
     if (/temporary hit points|temp hp/.test(context)) diceHints.push({ formula, kind: "heal", type: "temphp" });
     else if (/\bhit points\b|healing/.test(context)) diceHints.push({ formula, kind: "heal", type: "healing" });
     else diceHints.push({ formula, kind: "damage", type: DAMAGE_TYPE_WORDS.find((t) => context.includes(t)) ?? "" });
+  }
+
+  // A dice+modifier chain with NO classifying word after it -- the
+  // sentence's classifying word instead precedes the whole clause
+  // ("reduce the damage the target takes by 1d10 + your Proficiency
+  // Bonus.", the confirmed real Interception shape: diceRe above requires
+  // a trailing context word, which simply isn't there when the clause ends
+  // the sentence). Only fires when a modifier chain is actually present (a
+  // bare, unqualified dice mention with nothing classifying around it at
+  // all -- "roll 1d4 to determine the result" -- stays unclassified, same
+  // conservative behavior as before this fix applies), and only when the
+  // backward window contains an explicit classifying word -- same guard
+  // profRe below already uses, no silent "assume damage" default.
+  const diceWithModifierNoTrailingRe = new RegExp(`\\d+d\\d+(?:\\s*(?:\\+|plus)\\s*${MODIFIER_TERM})+`, "gi");
+  let dm2;
+  while ((dm2 = diceWithModifierNoTrailingRe.exec(text))) {
+    if (consumedRanges.some(([start, end]) => dm2.index >= start && dm2.index < end)) continue;
+    const context = text.slice(Math.max(0, dm2.index - 60), dm2.index).toLowerCase();
+    const formula = normalizeMergedFormula(dm2[0]);
+    consumedRanges.push([dm2.index, dm2.index + dm2[0].length]);
+    if (/temporary hit points|temp hp/.test(context)) diceHints.push({ formula, kind: "heal", type: "temphp" });
+    else if (/\bhit points\b|healing\b/.test(context)) diceHints.push({ formula, kind: "heal", type: "healing" });
+    else if (/\bdamage\b/.test(context)) diceHints.push({ formula, kind: "damage", type: DAMAGE_TYPE_WORDS.find((t) => context.includes(t)) ?? "" });
   }
 
   // Flat "(twice/half) your proficiency bonus" language — the same
@@ -341,6 +533,7 @@ export function scanSegmentText(text, spellNames, index) {
   const profRe = /\b(twice|double|half|three times|triple)?\s*(?:your\s+)?proficiency bonus\b/gi;
   let pm;
   while ((pm = profRe.exec(text))) {
+    if (consumedRanges.some(([start, end]) => pm.index >= start && pm.index < end)) continue;
     const context = text.slice(Math.max(0, pm.index - 60), pm.index).toLowerCase();
     const multiplier = { twice: " * 2", double: " * 2", half: " / 2", "three times": " * 3", triple: " * 3" }[pm[1]?.toLowerCase()] ?? "";
     const formula = `@prof${multiplier}`;
@@ -594,13 +787,16 @@ export function scanSegmentText(text, spellNames, index) {
   // redundant duplicate change.
   const seenHints = new Set();
   const dedupedEffectHints = effectHints.filter((h) => {
-    const dedupeKey = `${h.key} ${h.value}`;
+    const dedupeKey = `${h.key}\x00${h.value}`;
     if (seenHints.has(dedupeKey)) return false;
     seenHints.add(dedupeKey);
     return true;
   });
 
-  return { usesFormula, recoveryPeriod, savingThrow, diceHints, effectHints: dedupedEffectHints, statusHints, toggleStatusHints };
+  const activation = parseActivation(text);
+  const { range, target } = parseRangeAndTarget(text);
+
+  return { usesFormula, recoveryPeriod, savingThrow, diceHints, effectHints: dedupedEffectHints, statusHints, toggleStatusHints, activation, range, target };
 }
 
 // Best-guess mechanics scanner for a scraped feature's prose (used by the

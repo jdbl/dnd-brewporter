@@ -871,6 +871,37 @@ function copyMechanicsFrom(item, source) {
   if (source.img && source.img !== "icons/svg/upgrade.svg") item.img = source.img;
 }
 
+// D&D Beyond splits a single official feat with an in-fiction class choice
+// (2024's "Magic Initiate": pick any one of Cleric/Druid/Wizard's spell
+// list at selection) into several separately-purchasable named variants —
+// "Magic Initiate (Cleric)", "Magic Initiate (Druid)", "Magic Initiate
+// (Wizard)". normalizeName strips that trailing parenthetical before the
+// name-index lookup below runs, so all three variants resolve to the SAME
+// single official "Magic Initiate" item — correctly, since Foundry's own
+// SRD pack only ships the one general-purpose item the real rules describe
+// (the player narrows it to one class at chargen, not the compendium
+// author). Copying that shared item's `ItemChoice` advancement verbatim
+// onto all three DDB variants means each one's `restriction.list` still
+// covers all three classes, even though the DDB name itself already picked
+// one — confirmed real bug on all three Magic Initiate variants. Narrows
+// any copied ItemChoice/ItemGrant `restriction.list` down to just the one
+// class the DDB variant name specifies, but ONLY when that class is
+// already present in the copied list (never adds a class the source item
+// didn't already offer) — a no-op for any feat whose name has no trailing
+// parenthetical, or whose parenthetical doesn't slugify to a class already
+// in the list, so this is safe to run unconditionally on every copy.
+export function narrowSpellRestrictionToVariantClass(advancement, ddbName) {
+  const parenMatch = ddbName.match(/\(([^)]+)\)\s*$/);
+  if (!parenMatch) return advancement;
+  const variantClass = `class:${slugify(parenMatch[1])}`;
+
+  return Object.fromEntries(Object.entries(advancement).map(([id, entry]) => {
+    const list = entry?.configuration?.restriction?.list;
+    if (!Array.isArray(list) || list.length <= 1 || !list.includes(variantClass)) return [id, entry];
+    return [id, { ...entry, configuration: { ...entry.configuration, restriction: { ...entry.configuration.restriction, list: [variantClass] } } }];
+  }));
+}
+
 // D&D Beyond's own feat text is real, but the *mechanics* behind it are
 // frequently things no amount of prose-scanning recovers correctly — Alert's
 // initiative bonus is a bespoke `flags.dnd5e.initiativeAlert` change with no
@@ -892,6 +923,8 @@ async function copyOfficialFeatMechanics(item, index, report) {
   if (!source) return false;
 
   copyMechanicsFrom(item, source);
+  item.system.advancement = narrowSpellRestrictionToVariantClass(item.system.advancement, item.name);
+
   report.resolved.push({ context: item.name, name: "activities/effects/advancement", pack: `copied from ${match.match.pack}` });
   return true;
 }
@@ -931,7 +964,12 @@ async function importDdbFeat(featDef, index, report) {
       // is safe to apply without a review step (real DDB text, same trust
       // level as an auto-built class feature), and why unmatched named
       // sub-options are dropped rather than kept as blank stubs here.
-      const { effects, activities, advancement } = buildAutoMechanics(item.system.description.value, index, item.name);
+      // skipAbilityScoreAdvancement: true — assembleFeatItem already seeded
+      // item.system.advancement from this same description text; without
+      // this flag buildAutoMechanics re-derives an identical-but-freshly-
+      // ided AbilityScoreImprovement entry and the spread below would keep
+      // both, silently doubling the feat's own ASI grant.
+      const { effects, activities, advancement } = buildAutoMechanics(item.system.description.value, index, item.name, { skipAbilityScoreAdvancement: true });
       item.effects = effects;
       item.system.activities = activities;
       item.system.advancement = { ...item.system.advancement, ...advancement };

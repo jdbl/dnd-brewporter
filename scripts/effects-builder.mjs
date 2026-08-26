@@ -548,14 +548,26 @@ export function buildActivityData(type, form) {
     name: form.name || "",
     img: "",
     sort: 0,
-    activation: { type: form.activationType || "action", value: form.activationValue ?? null, condition: "", override: false },
+    // condition/range/target read from form.activationCondition/form.range/
+    // form.target when given (issue 017) -- previously always the empty
+    // default regardless of what the prose said, e.g. Interception's own
+    // "When a creature you can see damages a creature within 5 feet of
+    // you..." trigger clause, or Fireball-shaped range/area language.
+    activation: { type: form.activationType || "action", value: form.activationValue ?? null, condition: form.activationCondition || "", override: false },
     consumption: { targets: [], scaling: { allowed: false, max: "" } },
     description: { chat: "", value: "" },
     duration: { value: "", units: "inst", concentration: false, override: false },
     effects: (form.linkedEffectIds ?? []).map((id) => ({ _id: id })),
-    range: { value: null, units: "", special: "", override: false },
-    target: { affects: {}, template: {}, prompt: true, override: false },
-    uses: { spent: 0, max: "", recovery: [] },
+    range: { value: form.range?.value ?? null, units: form.range?.units ?? "", special: "", override: false },
+    target: { affects: form.target?.affects ?? {}, template: form.target?.template ?? {}, prompt: true, override: false },
+    // Generic across every activity type (issue 016) -- previously only the
+    // "cast" branch below read form.usesMax/form.recoveryPeriod, so a
+    // detected "usable once per long rest"-style limit on a save/damage/
+    // heal activity was silently discarded. The manual Build Feature
+    // dialog's own save/damage/heal/utility forms never set these two form
+    // fields at all, so this is a no-op there — only the auto-guess path
+    // (guessQueueEntries) populates them.
+    uses: { spent: 0, max: form.usesMax || "", recovery: form.usesMax ? [{ period: form.recoveryPeriod || "lr", type: "recoverAll", formula: "" }] : [] },
   };
 
   if (type === "save") {
@@ -580,7 +592,8 @@ export function buildActivityData(type, form) {
   if (type === "cast") {
     return {
       ...base,
-      uses: { spent: 0, max: form.usesMax || "", recovery: form.usesMax ? [{ period: form.recoveryPeriod || "lr", type: "recoverAll", formula: "" }] : [] },
+      // uses is already built generically above from form.usesMax/
+      // form.recoveryPeriod — no per-type override needed here anymore.
       // challenge.{attack,save} are flat number overrides (validated as
       // NumberField by the dnd5e system — confirmed live: an object here
       // throws "must be a number"), not a full ability/DC config. null
@@ -820,6 +833,22 @@ function guessQueueEntries(descriptionHtml, index, preference, featureName = "",
     const entriesBefore = entries.length;
     const heals = seg.diceHints.filter((d) => d.kind === "heal");
     const damages = seg.diceHints.filter((d) => d.kind === "damage");
+    // Segment-level, so every activity built from this segment's hints
+    // shares whatever rest-recovered use limit the same block of text
+    // described (issue 016) — previously only "cast" activities below ever
+    // saw these two fields; save/damage/heal activities always got the
+    // empty default even when the segment had a detected uses/recovery.
+    const usesMax = seg.usesFormula ?? "";
+    const recoveryPeriod = seg.recoveryPeriod ?? "lr";
+    // Also segment-level (issue 017) — activation type/condition and
+    // range/target are likewise read once per segment and shared by every
+    // activity built from it, same rationale as uses/recovery above:
+    // previously every guessed activity defaulted to a plain "action" with
+    // no condition/range/target regardless of what the prose said.
+    const activationType = seg.activation?.type || undefined; // undefined -> buildActivityData's own "action" default
+    const activationCondition = seg.activation?.condition || "";
+    const range = seg.range ?? null;
+    const target = seg.target ?? null;
 
     if (seg.savingThrow) {
       entries.push({
@@ -827,20 +856,21 @@ function guessQueueEntries(descriptionHtml, index, preference, featureName = "",
         data: buildActivityData("save", {
           name,
           saveAbility: [seg.savingThrow.ability],
-          dcMode: seg.savingThrow.dcSpellcasting ? "spellcasting" : "flat",
-          dcValue: "",
+          dcMode: seg.savingThrow.dcSpellcasting ? "spellcasting" : (seg.savingThrow.dcFormula ? "formula" : "flat"),
+          dcValue: seg.savingThrow.dcFormula ?? "",
           onSave: seg.savingThrow.onSaveHalf ? "half" : "none",
           damageParts: damages.map((d) => ({ formula: d.formula, type: d.type })),
+          usesMax, recoveryPeriod, activationType, activationCondition, range, target,
         }),
       });
     } else {
       for (const d of damages) {
-        entries.push({ kind: "activity", guessed: true, data: buildActivityData("damage", { name, damageParts: [{ formula: d.formula, type: d.type }], criticalBonus: "" }) });
+        entries.push({ kind: "activity", guessed: true, data: buildActivityData("damage", { name, damageParts: [{ formula: d.formula, type: d.type }], criticalBonus: "", usesMax, recoveryPeriod, activationType, activationCondition, range, target }) });
       }
     }
 
     for (const h of heals) {
-      entries.push({ kind: "activity", guessed: true, data: buildActivityData("heal", { name, healFormula: h.formula, healType: h.type }) });
+      entries.push({ kind: "activity", guessed: true, data: buildActivityData("heal", { name, healFormula: h.formula, healType: h.type, usesMax, recoveryPeriod, activationType, activationCondition, range, target }) });
     }
 
     for (const spellName of seg.spellNames) {
@@ -849,9 +879,15 @@ function guessQueueEntries(descriptionHtml, index, preference, featureName = "",
       entries.push({
         kind: "activity", guessed: true,
         data: buildActivityData("cast", {
-          name, activationType: "action", activationValue: null, linkedEffectIds: [],
+          // activationType here defaults to plain "action" (a spell grant
+          // usually just is one), but now defers to whatever the segment's
+          // own activation detector found first — e.g. War Caster's
+          // Reactive Spell ("use your Reaction to cast a spell..."), a
+          // cast-type activity that previously always hard-coded "action"
+          // regardless of the prose.
+          name, activationType: activationType ?? "action", activationValue: null, activationCondition, linkedEffectIds: [],
           spellUuid: match.uuid, spellName: match.name,
-          usesMax: seg.usesFormula ?? "", recoveryPeriod: seg.recoveryPeriod ?? "lr",
+          usesMax, recoveryPeriod,
         }),
       });
     }
@@ -884,17 +920,37 @@ function guessQueueEntries(descriptionHtml, index, preference, featureName = "",
     // Stonecunning item uses for its Tremorsense grant), one entry per
     // hint, instead of folded into the permanent statuses/changes effect
     // above.
+    const toggleEffectIds = [];
     for (const toggle of seg.toggleStatusHints ?? []) {
+      const toggleEffectData = buildActiveEffectData({
+        name: name || featureName || "Effect",
+        transfer: false,
+        durationType: toggle.durationType,
+        durationValue: toggle.durationValue,
+        changes: [],
+        statuses: [toggle.condition],
+      });
+      entries.push({ kind: "effect", guessed: true, data: toggleEffectData });
+      toggleEffectIds.push(toggleEffectData._id);
+    }
+
+    // A toggle effect above has no Activity of its own to trigger it
+    // UNLESS this same segment already built one from a saving throw/dice/
+    // spell hint further up (rare — a toggle grant is normally a segment's
+    // only mechanic). Without one, the effect exists but nothing in
+    // Foundry ever applies it — confirmed real bug: Fey Sentinel's
+    // Invisible-on-miss effect was built exactly like this and stayed
+    // permanently unreachable, since nothing referenced it (issue 017).
+    // Built as a Utility activity carrying this segment's own detected
+    // activation type/condition (Reaction/Bonus Action, from the very same
+    // "you can take a Reaction to..." phrasing the toggle detector itself
+    // matched on) with every toggle effect from this segment linked onto
+    // it, so it's reachable the same way a real dnd5e activity that
+    // applies an effect always is.
+    if (toggleEffectIds.length && entries.length === entriesBefore + toggleEffectIds.length) {
       entries.push({
-        kind: "effect", guessed: true,
-        data: buildActiveEffectData({
-          name: name || featureName || "Effect",
-          transfer: false,
-          durationType: toggle.durationType,
-          durationValue: toggle.durationValue,
-          changes: [],
-          statuses: [toggle.condition],
-        }),
+        kind: "activity", guessed: true,
+        data: buildActivityData("utility", { name, activationType, activationCondition, linkedEffectIds: toggleEffectIds }),
       });
     }
 
@@ -925,7 +981,16 @@ function guessQueueEntries(descriptionHtml, index, preference, featureName = "",
 // item instead, so `preserveUnmatchedLabels: false` here: with no human
 // review step to catch it, a stray "Repeatable"/"Spell Change." stub isn't
 // a helpful placeholder, just noise the official item doesn't have either.
-export function buildAutoMechanics(descriptionHtml, index, featureName = "") {
+// `skipAbilityScoreAdvancement` exists for importDdbFeat: assembleFeatItem
+// already seeds item.system.advancement from guessAbilityScoreAdvancement()
+// over this exact same description text before buildAutoMechanics ever
+// runs, so re-deriving it here and merging both in would silently double
+// the feat's own ASI grant (two identical AbilityScoreImprovement entries,
+// each with a fresh random id, so neither looks like a duplicate to a
+// naive key-collision check). Class features and race traits (this
+// function's other callers) never pre-seed an ASI guess of their own, so
+// they leave this false and still get it from here as before.
+export function buildAutoMechanics(descriptionHtml, index, featureName = "", { skipAbilityScoreAdvancement = false } = {}) {
   const { entries } = guessQueueEntries(descriptionHtml, index, rulesetPreference(), featureName, { preserveUnmatchedLabels: false });
   return {
     effects: entries.filter((q) => q.kind === "effect").map((q) => q.data),
@@ -936,7 +1001,10 @@ export function buildAutoMechanics(descriptionHtml, index, featureName = "") {
     // Improvement boilerplate (guessAbilityScoreAdvancement), both built
     // straight from the same trusted text and merged into one advancement
     // object (independently-generated random ids, so no key collisions).
-    advancement: { ...(guessAbilityScoreAdvancement(descriptionHtml) ?? {}), ...guessProficiencyAdvancement(descriptionHtml) },
+    advancement: {
+      ...(skipAbilityScoreAdvancement ? {} : (guessAbilityScoreAdvancement(descriptionHtml) ?? {})),
+      ...guessProficiencyAdvancement(descriptionHtml),
+    },
   };
 }
 
