@@ -91,8 +91,13 @@ export async function buildNameIndex() {
       // "system.type.subtype" is what tells a Fighting Style Feat apart
       // from every other kind of feat (general/origin/epicBoon/...) — see
       // resolvePoolRestriction, which needs it to resolve an ItemChoice
-      // pool placeholder without a name to look up at all.
-      idx = await pack.getIndex({ fields: ["folder", "system.type.subtype"] });
+      // pool placeholder without a name to look up at all. "system.requirements"
+      // and "system.type.value" are the race-trait equivalent — see
+      // copyOfficialRaceTraitMechanics/findRaceTraitMatch, which need them to
+      // scope a race trait name match down to its own species (a race trait's
+      // system.type.value is "race", and system.requirements holds the owning
+      // species name — see buildRaceTraitItemData in ddb-scraper.mjs).
+      idx = await pack.getIndex({ fields: ["folder", "system.type.subtype", "system.requirements", "system.type.value"] });
     } catch (err) {
       console.warn(`${MODULE_ID} | Could not index pack ${pack.collection}`, err);
       continue;
@@ -108,6 +113,8 @@ export async function buildNameIndex() {
         uuid, name: entry.name, pack: pack.collection, tier, img: entry.img, type: entry.type,
         classHint: topFolderName(pack, entry.folder),
         subtype: entry.system?.type?.subtype,
+        raceRequirement: entry.system?.requirements,
+        raceCategory: entry.system?.type?.value,
       });
     }
   }
@@ -150,6 +157,33 @@ function lookup(index, rawName, expectedClass) {
   const uniqueUuids = new Set(pool.map((c) => c.uuid));
   if (uniqueUuids.size === 1) return { status: "resolved", match: pool[0], classMatched: false };
   return { status: "ambiguous", candidates: pool, classMatched: false };
+}
+
+// A race trait's name alone is a much weaker signal than a feat's — feat
+// names are overwhelmingly globally unique, but trait names collide
+// constantly across species (multiple species each have their own "Speed",
+// "Size", "Darkvision", "Ability Score Increase(s)", "Creature Type"). So
+// unlike `lookup` (which trusts a unique name-only match), this only ever
+// returns a single candidate that is BOTH indexed as an actual race trait
+// (`raceCategory === "race"`, i.e. the pack entry's own `system.type.value`
+// — see buildRaceTraitItemData in ddb-scraper.mjs) AND whose
+// `raceRequirement` (that entry's `system.requirements`) normalizes to the
+// same species as `raceDef.fullName`. Zero or more-than-one survivor is
+// treated the same as "no match" — deliberately conservative, since a wrong
+// guess here means silently copying another species' mechanics. Kept as a
+// pure function (no Foundry global reads) so the matching logic itself is
+// directly unit-testable without mocking `game`/`fromUuid` — see
+// copyOfficialRaceTraitMechanics for the Foundry-API-calling wrapper around
+// this.
+export function findRaceTraitMatch(candidates, raceDef, preference) {
+  if (!candidates?.length) return null;
+  const speciesKey = normalizeName(raceDef?.fullName ?? "");
+  const pool = applyRulesetPreference(candidates, preference);
+  const matches = pool.filter(
+    (c) => c.raceCategory === "race" && c.raceRequirement && normalizeName(c.raceRequirement) === speciesKey
+  );
+  const uniqueUuids = new Set(matches.map((c) => c.uuid));
+  return uniqueUuids.size === 1 ? matches[0] : null;
 }
 
 // Neither an ambiguous match (multiple compendium items share a name) nor
@@ -819,6 +853,24 @@ async function ensureDdbAuth() {
   if (!result.success) throw new Error(`D&D Beyond auth failed: ${result.message ?? "unknown error"}`);
 }
 
+// Overwrites `item`'s effects/system.activities/system.advancement in place
+// with fresh copies (new `_id`s per entry, so cloning the same source twice
+// never collides) of a real compendium item's own data, plus its img unless
+// that's still the generic placeholder. Shared by copyOfficialFeatMechanics
+// and copyOfficialRaceTraitMechanics below — both trust an official dnd5e
+// compendium item's real, hand-authored mechanics over a prose-guessed
+// approximation once a name (and, for a race trait, species) match is found.
+function copyMechanicsFrom(item, source) {
+  item.effects = (source.effects ?? []).map((e) => ({ ...e, _id: randomId() }));
+  item.system.activities = Object.fromEntries(
+    Object.values(source.system?.activities ?? {}).map((a) => { const id = randomId(); return [id, { ...a, _id: id }]; })
+  );
+  item.system.advancement = Object.fromEntries(
+    Object.values(source.system?.advancement ?? {}).map((a) => { const id = randomId(); return [id, { ...a, _id: id }]; })
+  );
+  if (source.img && source.img !== "icons/svg/upgrade.svg") item.img = source.img;
+}
+
 // D&D Beyond's own feat text is real, but the *mechanics* behind it are
 // frequently things no amount of prose-scanning recovers correctly — Alert's
 // initiative bonus is a bespoke `flags.dnd5e.initiativeAlert` change with no
@@ -839,16 +891,32 @@ async function copyOfficialFeatMechanics(item, index, report) {
   const source = (await fromUuid(match.match.uuid))?.toObject();
   if (!source) return false;
 
-  item.effects = (source.effects ?? []).map((e) => ({ ...e, _id: randomId() }));
-  item.system.activities = Object.fromEntries(
-    Object.values(source.system?.activities ?? {}).map((a) => { const id = randomId(); return [id, { ...a, _id: id }]; })
-  );
-  item.system.advancement = Object.fromEntries(
-    Object.values(source.system?.advancement ?? {}).map((a) => { const id = randomId(); return [id, { ...a, _id: id }]; })
-  );
-  if (source.img && source.img !== "icons/svg/upgrade.svg") item.img = source.img;
-
+  copyMechanicsFrom(item, source);
   report.resolved.push({ context: item.name, name: "activities/effects/advancement", pack: `copied from ${match.match.pack}` });
+  return true;
+}
+
+// The race-trait equivalent of copyOfficialFeatMechanics, guarded by the
+// stricter species-scoped match findRaceTraitMatch implements (a plain
+// name-only lookup, safe for feats, would silently copy the wrong species'
+// data here — see findRaceTraitMatch's own comment). `item` is the trait's
+// own about-to-be-created Feature data (assembleRaceTraitItem's output);
+// `raceDef` is the DDB species definition it belongs to, used only for its
+// `fullName`. Returns true (and overwrites item's mechanics in place) when a
+// same-species official trait was found and copied; false when there's
+// nothing to copy from, so the caller falls back to the prose-based guess —
+// same "copied ?? fall back" shape importDdbFeat already uses.
+async function copyOfficialRaceTraitMechanics(item, raceDef, index, report) {
+  const candidates = index.get(normalizeName(item.name));
+  const preference = game.settings.get(MODULE_ID, "rulesetPreference");
+  const match = findRaceTraitMatch(candidates, raceDef, preference);
+  if (!match) return false;
+
+  const source = (await fromUuid(match.uuid))?.toObject();
+  if (!source) return false;
+
+  copyMechanicsFrom(item, source);
+  report.resolved.push({ context: item.name, name: "activities/effects/advancement", pack: `copied from ${match.pack}` });
   return true;
 }
 
@@ -899,14 +967,22 @@ async function importDdbRace(raceDef, index, report) {
       const data = assembleRaceTraitItem(trait, raceDef);
       data.folder = traitsFolder;
       traitDescriptions.push(trait.description);
-      // Real D&D Beyond trait text (Darkvision, Dwarven Resilience-style
-      // resistances, speed increases, ...) — same trust level buildAutoMechanics
-      // already applies to a feat's description, so a racial trait gets the
-      // same scan instead of a permanently empty effects/activities set.
-      const { effects, activities, advancement } = buildAutoMechanics(data.system.description.value, index, data.name);
-      data.effects = effects;
-      data.system.activities = activities;
-      data.system.advancement = { ...(data.system.advancement ?? {}), ...advancement };
+      // Prefer copying a same-species official trait's real, hand-authored
+      // mechanics (dnd5e's free origins24 pack ships every core PHB 2024
+      // species' traits already correctly built — see
+      // copyOfficialRaceTraitMechanics) over guessing from prose. Only when
+      // there's nothing to copy from (homebrew/expanded species, or a
+      // core-species trait the free pack doesn't ship) does this fall back
+      // to the same real-D&D-Beyond-text scan a feat's description already
+      // gets — same trust level, same "copied ?? fall back" shape
+      // importDdbFeat uses.
+      const copied = await copyOfficialRaceTraitMechanics(data, raceDef, index, report);
+      if (!copied) {
+        const { effects, activities, advancement } = buildAutoMechanics(data.system.description.value, index, data.name);
+        data.effects = effects;
+        data.system.activities = activities;
+        data.system.advancement = { ...(data.system.advancement ?? {}), ...advancement };
+      }
       const created = await Item.create(data);
       if (!created) throw new Error(`Foundry rejected trait "${trait.name}"'s data (check the browser console for a DataModelValidationError).`);
       report.created.push({ name: created.name, uuid: created.uuid, file: `${raceDef.fullName} (trait)`, via: "ddb" });
