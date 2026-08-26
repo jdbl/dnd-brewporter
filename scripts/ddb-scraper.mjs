@@ -168,6 +168,47 @@ export function usableRacialTraits(raceDef) {
     .filter((d) => d && !d.hideInSheet);
 }
 
+// Multiple species audits (Orc, Dragonborn, Goliath, Tiefling, Human) found
+// the same pattern: a species' racialTraits can contain both a legacy/2014
+// version and a current 2024 version of conceptually the same trait, both
+// surviving the hideInSheet filter above and both getting imported as
+// separate Feature items (e.g. Orc's "Adrenaline Rush" 2024 alongside
+// "Relentless Endurance" 2014, the trait it replaced) — sometimes with
+// genuinely different mechanical text per copy, not identical re-run
+// duplicates. There's no reliable per-trait rules-version signal in the
+// static description data this codebase's tests have access to, so this
+// deliberately does not guess which copy is "right" — it only flags the
+// collision (issue 022) for a human to review; it never drops or merges a
+// trait. Two traits collide when they'd produce the same
+// system.identifier (slugify(name), see buildRaceTraitItemData below) or
+// when their names are identical except for a trailing plural "s"
+// (case-insensitive) — e.g. "Ability Score Increase" vs "Ability Score
+// Increases", or two traits both literally named "Powerful Build" (an
+// exact-name repeat already collides on slug too, so no separate check is
+// needed for that case).
+function stripTrailingS(name) {
+  const lower = name.toLowerCase().trim();
+  return lower.endsWith("s") ? lower.slice(0, -1) : lower;
+}
+
+export function findDuplicateTraitNameWarnings(traits, raceName) {
+  const warnings = [];
+  for (let i = 0; i < traits.length; i++) {
+    for (let j = i + 1; j < traits.length; j++) {
+      const a = traits[i], b = traits[j];
+      if (!a?.name || !b?.name) continue;
+      const collides = slugify(a.name) === slugify(b.name) || stripTrailingS(a.name) === stripTrailingS(b.name);
+      if (collides) {
+        warnings.push({
+          context: raceName,
+          reason: `"${a.name}" and "${b.name}" look like duplicate/legacy versions of the same trait (same identifier or near-identical name) — both were still imported as separate items; review and manually remove/merge the wrong one.`,
+        });
+      }
+    }
+  }
+  return warnings;
+}
+
 // Folder layout matches dnd5e's own origins24 pack exactly: species sit at
 // the pack root, their traits nest under Traits/<Race Name> rather than
 // directly under the race — verified against packs/_source/origins24.

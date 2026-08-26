@@ -1,7 +1,7 @@
 import { scrapeWikidotHtml, resolveSourceUrl, isWikidotPage, assembleSubclassItem, slugify, normalizeName, searchIndex, MODULE_ID, applyRulesetPreference, randomId } from "./scraper.mjs";
 import { scrapeFreeformSubclass } from "./freeform-scraper.mjs";
 import { showBuildFeatureDialog, buildAutoMechanics } from "./effects-builder.mjs";
-import { sendDdbAuth, fetchDdbGameData, assembleFeatItem, usableRacialTraits, assembleRaceTraitItem, assembleRaceItem, buildSizeAdvancement, mergeTraitDerivedMovement, featFolderSegments, raceTraitFolderSegments, raceFolderSegments, assembleClassItem, classFolderSegments, assembleSubclassItem as assembleDdbSubclassItem, subclassFolderSegments, buildDdbClassFeatureItemData, assembleBackgroundItem, assembleBackgroundFeatureItem, backgroundFolderSegments, backgroundFeatureFolderSegments } from "./ddb-scraper.mjs";
+import { sendDdbAuth, fetchDdbGameData, assembleFeatItem, usableRacialTraits, findDuplicateTraitNameWarnings, assembleRaceTraitItem, assembleRaceItem, buildSizeAdvancement, mergeTraitDerivedMovement, featFolderSegments, raceTraitFolderSegments, raceFolderSegments, assembleClassItem, classFolderSegments, assembleSubclassItem as assembleDdbSubclassItem, subclassFolderSegments, buildDdbClassFeatureItemData, assembleBackgroundItem, assembleBackgroundFeatureItem, backgroundFolderSegments, backgroundFeatureFolderSegments } from "./ddb-scraper.mjs";
 
 // Below this many detected "Nth Level:" headings, a freeform parse is
 // shown for review before creating anything — a strong sign the doc
@@ -960,6 +960,13 @@ async function importDdbClass(classDef, index, report) {
 async function importDdbRace(raceDef, index, report) {
   try {
     const traits = usableRacialTraits(raceDef);
+    // Issue 022: flag same-identifier/near-identical-name trait collisions
+    // (legacy-vs-current duplicates DDB sometimes ships in one species'
+    // racialTraits) for human review — this never drops or merges a trait,
+    // both items below still get created exactly as before.
+    for (const warning of findDuplicateTraitNameWarnings(traits, raceDef.fullName)) {
+      report.warnings.push(warning);
+    }
     const traitsFolder = await resolveFolderPath(raceTraitFolderSegments(raceDef));
     const traitsByLevel = {};
     const traitDescriptions = [];
