@@ -419,12 +419,40 @@ export function scanSegmentText(text, spellNames, index) {
     // actually prevents false positives, same as it always has for "cast":
     // an unrelated "have the Invisible condition"-shaped sentence produces
     // a candidate that simply isn't in the spell index and gets dropped.
-    const castRe = /\b(?:casts?(?:ing)?|have|has|know|knows|learn|learns)\s+(?:the\s+)?((?:(?!spell\b)[A-Za-z][a-zA-Z']*\s*){1,4})(?:spell)?/g;
+    //
+    // "cantrip"/"cantrips" needs the exact same treatment as "spell" -- real
+    // D&D Beyond racial-trait prose grants cantrips just as often as leveled
+    // spells ("you know the Minor Illusion cantrip", "you know the Mending
+    // and Prestidigitation cantrips"), and without its own exclusion the
+    // repeated word group swallows it into the candidate the same way
+    // "spell" used to (e.g. "Minor Illusion Cantrip"), which then fails the
+    // index lookup below and silently drops the grant entirely (issue 021 --
+    // confirmed live on Elf's Elven Lineage, Gnome's Gnomish Lineage, and
+    // Tiefling's Otherworldly Presence/Infernal Legacy/Fiendish Legacy).
+    // Excluded from the repeated word group's negative lookahead and
+    // consumed by the trailing optional suffix alongside "spell".
+    //
+    // The plural, two-name shape ("the Mending and Prestidigitation
+    // cantrips") captures as a single "Mending and Prestidigitation"
+    // run -- the connector "and" isn't excluded from the repeated word
+    // group, same as it isn't for the multi-damage-type list traitRe
+    // splits further down. That combined string is never itself a real
+    // compendium entry, so it's split the same way traitRe's list is: try
+    // the whole candidate against the index first (the common single-name
+    // case), and only fall back to splitting on ", "/" and " when the whole
+    // string doesn't match, validating each piece against the index on its
+    // own so a genuine multi-name grant still resolves every name instead of
+    // the whole-string lookup failing and dropping all of them.
+    const castRe = /\b(?:casts?(?:ing)?|have|has|know|knows|learn|learns)\s+(?:the\s+)?((?:(?!spell\b|cantrips?\b)[A-Za-z][a-zA-Z']*\s*){1,4})(?:spell|cantrips?)?/g;
     let cm;
     while ((cm = castRe.exec(text))) {
       const candidate = cm[1].trim();
-      if (candidate && index.has(normalizeName(candidate)) && !spellNames.some((n) => normalizeName(n) === normalizeName(candidate))) {
-        spellNames.push(candidate);
+      if (!candidate) continue;
+      const pieces = index.has(normalizeName(candidate)) ? [candidate] : candidate.split(/\s*,\s*|\s+and\s+/i).map((p) => p.trim()).filter(Boolean);
+      for (const piece of pieces) {
+        if (index.has(normalizeName(piece)) && !spellNames.some((n) => normalizeName(n) === normalizeName(piece))) {
+          spellNames.push(piece);
+        }
       }
     }
   }
