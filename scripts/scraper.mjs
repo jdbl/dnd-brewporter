@@ -62,6 +62,23 @@ const TOOL_CATEGORY_WORDS = [
   [/vehicles?/i, "vehicle"],
 ];
 
+// Matches dnd5e's own CONFIG.DND5E.languages standard/exotic children keys
+// (module/config.mjs) — same "small local list" rationale as DAMAGE_TYPE_WORDS
+// above. Only covers the language names that actually show up in real
+// "speak, read, and write X" grant text; not exhaustive of every exotic/
+// primordial dialect since those never appear in that boilerplate.
+const LANGUAGE_CODES = {
+  common: "languages:standard:common", draconic: "languages:standard:draconic",
+  dwarvish: "languages:standard:dwarvish", elvish: "languages:standard:elvish",
+  giant: "languages:standard:giant", gnomish: "languages:standard:gnomish",
+  goblin: "languages:standard:goblin", halfling: "languages:standard:halfling",
+  orc: "languages:standard:orc", abyssal: "languages:exotic:abyssal",
+  celestial: "languages:exotic:celestial", "deep speech": "languages:exotic:deep",
+  druidic: "languages:exotic:druidic", infernal: "languages:exotic:infernal",
+  primordial: "languages:exotic:primordial", sylvan: "languages:exotic:sylvan",
+  undercommon: "languages:exotic:undercommon", "thieves' cant": "languages:exotic:cant",
+};
+
 // Classes where the generic full/half/third/pact heuristic can't tell the
 // difference: 2024-rules Artificer reaches the same max spell level (5th)
 // and starts at the same class level (1) as a true half-caster now that
@@ -70,6 +87,25 @@ const TOOL_CATEGORY_WORDS = [
 // progression key (module/config.mjs), so this is a deliberate name-based
 // exception, not a new generic rule.
 const PROGRESSION_OVERRIDES = { artificer: "artificer" };
+
+// Unlike scrapeClass's own progression heuristic (a class page always
+// carries its own spell-slot table to read maxSpellSlotLevel/hasPactColumn
+// off of), assembleSubclassItem has no equivalent table to parse — a
+// wikidot subclass page's own spellcasting feature is prose ("you learn
+// spells as shown in the Eldritch Knight Spellcasting table below"), not a
+// structured table this scraper captures (parseSubclassContent only pulls
+// out named *spell grants* and generic scale columns, not a slots-per-level
+// table). Rather than build table-detection for a case this narrow, this
+// hardcodes the only two subclasses in either ruleset that grant their own
+// spellcasting independent of their (non-caster) base class — Eldritch
+// Knight (Fighter) and Arcane Trickster (Rogue), both third-caster
+// progression on Intelligence in both 2014 and 2024 rules. Keyed by
+// deriveSubclassIdentifier's own output so it lines up with `identifier`
+// below without a second name-matching scheme.
+const SUBCLASS_SPELLCASTING_OVERRIDES = {
+  "eldritch-knight": { progression: "third", ability: "int" },
+  "arcane-trickster": { progression: "third", ability: "int" },
+};
 
 const SPELL_COL = /^(1st|2nd|3rd|4th|5th|6th|7th|8th|9th)$/i;
 const PACT_SLOT_COL = /^(Spell Slots|Slot Level)$/i;
@@ -173,26 +209,292 @@ function leadingBoldLabel(el) {
 // shared by every segment in guessFeatureMechanics() below so a sub-option's
 // mechanics (e.g. Refreshing Step's 1d10 Temp HP) are only ever attributed to
 // that segment, not smeared across the whole feature's text.
-function scanSegmentText(text, spellNames, index) {
+// Shared word->dnd5e movement-type key mapping, used by all three
+// walking/climbing/swimming/flying/burrowing speed detectors inside
+// scanSegmentText (delta "increases by", delta-to-target "increases to",
+// and the absolute "you have a ... speed of" grant) so the three don't each
+// repeat their own copy.
+const MOVEMENT_KEY_BY_WORD = { walking: "walk", climbing: "climb", swimming: "swim", flying: "fly", burrowing: "burrow" };
+
+// Shared guard for the self-granted-condition detector and the condition-
+// immunity detector's "immune to this ability" vs "immune to the X
+// condition" distinction inside scanSegmentText. Given the text immediately
+// preceding a matched "<condition> condition" mention (the same `before`
+// slice both detectors already compute), returns whether it reads as a
+// genuine self-grant/self-referential immunity rather than a guard clause,
+// a negated clause, a save-or-suffer clause aimed at someone else, or a
+// mention about a different subject entirely.
+//
+// Confirmed real misfires this rejects (issue 007): Athlete ("When you
+// have the Prone condition..."), Mounted Combatant ("...neither of you can
+// have the Incapacitated condition" / "...if you don't have the
+// Incapacitated condition"), Pack Fighting ("...the ally doesn't have the
+// Incapacitated condition"), Shield Master ("...cause it to have the Prone
+// condition"), Prone Fighting ("While you have the Prone condition..."),
+// and a self-referential "immune to this ability" mention sitting where a
+// condition target would be (Infernal Dragoon).
+export function isGenuineSelfGrant(before) {
+  const clause = (before ?? "").replace(/\([^)]*\)/g, "");
+
+  // A save-or-suffer clause immediately before this mention almost always
+  // targets someone else the feature affects, not its own possessor.
+  if (/\bsaving throw\b|\bspell save DC\b/i.test(clause)) return false;
+
+  // An earlier "until" feeding into this same "or" reads as one more entry
+  // in a list of ways an unrelated effect ENDS ("lasts...until X...or have
+  // the Y condition"), not a status being granted.
+  if (/\buntil\b/i.test(clause) && /\bor\s*$/i.test(clause)) return false;
+
+  // A guard/negated clause describes a condition to check FOR, not one to
+  // grant: "when/while/if you (already) have...", "doesn't/don't/can't/
+  // cannot have...", "neither...".
+  if (/\b(?:when|while|if)\s+you\s+(?:already\s+)?$/i.test(clause)) return false;
+  if (/\b(?:doesn't|don't|didn't|does not|do not|did not|can't|cannot)\s*$/i.test(clause)) return false;
+  if (/\bneither\b/i.test(clause)) return false;
+
+  // A third-party subject -- or a self-referential non-condition target
+  // like "this ability" -- immediately before the match means the
+  // condition is being applied to, or checked on, something other than the
+  // feature's own holder.
+  if (/\b(?:it|this creature|that creature|the target|the ally|your (?:mount|companion|familiar)|this\s+(?:ability|attack|effect|feature|trait)(?:'s)?)\s*(?:to\s+)?$/i.test(clause)) return false;
+
+  return true;
+}
+
+// Parses an explicit "DC 8 + your Constitution modifier + your Proficiency
+// Bonus" style clause -- any term order, "+"/"plus" as connectors, "your"/
+// "the" optional -- into a dnd5e roll-data formula string like
+// "8 + @abilities.con.mod + @prof" (issue 016). Only resolves a LITERALLY
+// NAMED ability: "the ability you increased with this feat" / "your
+// spellcasting ability modifier" is a player choice with no stable
+// per-item roll-data key dnd5e exposes for "whichever ability this
+// specific feat's ASI granted", so that phrasing is deliberately left
+// unresolved here rather than guessed at -- whatever else in the clause IS
+// resolvable (e.g. just "8 + @prof") is still returned. Returns null when
+// no numeric "DC <N>" anchor is found at all, so callers can fall back to
+// their own spellcasting/flat-DC handling.
+export function parseDcFormula(text) {
+  const dcMatch = text.match(/\bDC\s*(?:of\s*)?(?:equal to\s*)?(\d+)\b/i);
+  if (!dcMatch) return null;
+
+  // Confirmed real phrasings keep every modifier term within a few words of
+  // the DC number itself -- a short window after it avoids picking up an
+  // unrelated ability/proficiency mention later in a long segment.
+  const window = text.slice(dcMatch.index, dcMatch.index + 120);
+  const terms = [];
+
+  const abilityRe = /\b(Strength|Dexterity|Constitution|Intelligence|Wisdom|Charisma)\s+modifier\b/gi;
+  let am;
+  while ((am = abilityRe.exec(window))) {
+    const code = abilityCode(am[1]);
+    if (code) terms.push({ index: am.index, text: `@abilities.${code}.mod` });
+  }
+
+  const profRe = /\bproficiency bonus\b/gi;
+  let pm;
+  while ((pm = profRe.exec(window))) terms.push({ index: pm.index, text: "@prof" });
+
+  if (!terms.length) return null;
+  terms.sort((a, b) => a.index - b.index);
+  const seen = new Set();
+  const ordered = terms.filter((t) => (seen.has(t.text) ? false : (seen.add(t.text), true)));
+  return [dcMatch[1], ...ordered.map((t) => t.text)].join(" + ");
+}
+
+// Explicit action-economy phrasing (issue 017) -- every activity guessed by
+// this scanner previously defaulted to a plain "action" with no trigger
+// condition regardless of what the prose said, which is why so many
+// generated reaction/bonus-action features (Interception, Telekinetic,
+// War Caster's Reactive Spell, ...) came out activation-type "action"
+// instead of "reaction"/"bonus". Checked in specificity order so a segment
+// that happens to mention more than one doesn't get the wrong one.
+const REACTION_PHRASE_RE = /\b(?:as|using|use|takes?)\s+(?:a|your)\s+reaction\b/i;
+const BONUS_ACTION_PHRASE_RE = /\b(?:as|using|use|takes?)\s+(?:a|your)\s+bonus action\b/i;
+const ACTION_PHRASE_RE = /\b(?:as|using|use|takes?)\s+(?:a|your|an)\s+action\b/i;
+// A leading "When X, ..." / "Immediately after X, ..." clause -- dnd5e's
+// own activation.condition field wants exactly this kind of free text.
+// Anchored to the start of the segment (real prose almost always leads
+// with its own trigger clause) rather than scanning anywhere in a long
+// segment, where an unrelated "when"/"if" elsewhere could be misattributed
+// as the activation trigger.
+const TRIGGER_CLAUSE_RE = /^\s*((?:When|Whenever|If|Immediately after)\b[^,.]+)[,.]/i;
+
+export function parseActivation(text) {
+  let type = null;
+  if (REACTION_PHRASE_RE.test(text)) type = "reaction";
+  else if (BONUS_ACTION_PHRASE_RE.test(text)) type = "bonus";
+  else if (ACTION_PHRASE_RE.test(text)) type = "action";
+
+  const triggerMatch = text.match(TRIGGER_CLAUSE_RE);
+  const condition = triggerMatch ? triggerMatch[1].trim() : "";
+  // A stated trigger with no explicit action-economy word ("Immediately
+  // after you take the Attack action, you can teleport...") is exactly
+  // what dnd5e's own "Special" activation type is for -- a triggered
+  // ability that isn't on the normal action/bonus/reaction economy.
+  if (!type && condition) type = "special";
+
+  return { type, condition };
+}
+
+// Range and target parsing (issue 017) -- confirmed against real dnd5e-
+// shipped data (Fireball for a plain range + sphere template, Bless for a
+// multi-target affects.count/type, Aura of Protection for an Emanation --
+// which dnd5e's own schema stores under template.type "radius", not
+// "emanation", despite the 2024 rules text always saying "Emanation").
+// Deliberately narrow, literal phrasings only -- same "starting point for
+// review" philosophy as the rest of this scanner, and everything built
+// from these stays fully editable on the item sheet afterward.
+const AREA_TEMPLATE_TYPE_BY_WORD = {
+  emanation: "radius", radius: "radius", sphere: "sphere", cone: "cone",
+  cube: "cube", line: "line", cylinder: "cylinder", square: "square", wall: "wall",
+};
+
+export function parseRangeAndTarget(text) {
+  let range = null;
+  const rangeMatch = text.match(/\bwithin\s+(\d+)\s*(?:feet|foot|ft\.?)\b/i);
+  if (rangeMatch) range = { value: Number(rangeMatch[1]), units: "ft" };
+
+  let target = null;
+  const areaMatch = text.match(/\b(\d+)[\s-]foot(?:-radius)?\s+(emanation|radius|sphere|cone|cube|line|cylinder|square|wall)\b/i);
+  if (areaMatch) {
+    target = { template: { type: AREA_TEMPLATE_TYPE_BY_WORD[areaMatch[2].toLowerCase()], size: areaMatch[1], units: "ft" } };
+  } else {
+    const countMatch = text.match(/\bup to\s+(\w+)\s+creatures?\b/i) ?? text.match(/\b(\w+)\s+creatures?\s+of your choice\b/i);
+    if (countMatch) {
+      const word = countMatch[1].toLowerCase();
+      const count = NUMBER_WORDS[word] ?? (/^\d+$/.test(word) ? Number(word) : null);
+      if (count) target = { affects: { type: "creature", count: String(count) } };
+    }
+  }
+
+  return { range, target };
+}
+
+// Converts a raw dice+modifier match (e.g. "1d10 + your Proficiency Bonus",
+// "2d6 + your Charisma modifier + your Proficiency Bonus") from the merged
+// diceRe above into a plain dnd5e roll-data formula string, same
+// whitespace-stripped convention the old dice-only formula already used.
+function normalizeMergedFormula(raw) {
+  return raw
+    .replace(/\bplus\b/gi, "+")
+    .replace(/(?:your\s+)?(Strength|Dexterity|Constitution|Intelligence|Wisdom|Charisma)\s+modifier/gi, (_, ability) => `@abilities.${abilityCode(ability)}.mod`)
+    .replace(/(twice|double|half|three times|triple)?\s*(?:your\s+)?proficiency bonus/gi, (_, mult) => {
+      const multiplier = { twice: "*2", double: "*2", half: "/2", "three times": "*3", triple: "*3" }[mult?.toLowerCase()] ?? "";
+      return `@prof${multiplier}`;
+    })
+    .replace(/\s+/g, "");
+}
+
+// Exported (in addition to isGenuineSelfGrant) so the self-grant/toggle-
+// grant test suite can exercise the full scanner directly against plain
+// text -- guessFeatureMechanics' own DOMParser-based HTML wrapper around
+// this function can't run outside a browser, but scanSegmentText itself
+// never touches the DOM, so it stays callable from a plain Node test.
+export function scanSegmentText(text, spellNames, index) {
   if (!spellNames.length && index) {
-    const castRe = /\bcasts?(?:ing)?\s+(?:the\s+)?((?:[A-Z][a-zA-Z']*\s*){1,4})(?:spell)?/g;
+    // Real D&D Beyond prose almost always writes spell names lowercase
+    // ("cast the misty step spell"), unlike wikidot's Title-Case class-
+    // feature text this was originally written against -- dropped the
+    // [A-Z] requirement so both styles match. The exact-match lookup below
+    // against the real compendium index (not just "looks like a name") is
+    // what actually prevents false positives on arbitrary lowercase
+    // phrases, so nothing else needs to change there -- but the repeated
+    // word group itself now needs its own guard: with lowercase words
+    // allowed, the trailing literal "spell" would otherwise get swallowed
+    // into the captured name too (e.g. "Fireball spell" as one candidate
+    // instead of "Fireball"), since the old Title-Case requirement used to
+    // stop the capture there for free. A negative lookahead keeps "spell"
+    // out of the repeated word group so the trailing `(?:spell)?` still
+    // consumes it separately, same as before this relaxation.
+    //
+    // "cast(s/ing)" isn't the only verb real 2024 spell-grant prose uses --
+    // "you always have the Misty Step spell prepared" (Fey Touched, Fey
+    // Sentinel's Entangle, Infernal Bulwark's Armor of Agathys, Infernal
+    // Dragoon's Magic Weapon, Shadow Touched's Invisibility, ...) never
+    // says "cast" anywhere near the spell's own name, so the old verb-only
+    // alternation missed every one of these entirely (issue 019). Widened
+    // to also match "have/has/know/knows/learn/learns" -- broader as a
+    // trigger, but the same hard index-match gate below (a candidate must
+    // be a REAL compendium spell name, not just "looks like one") is what
+    // actually prevents false positives, same as it always has for "cast":
+    // an unrelated "have the Invisible condition"-shaped sentence produces
+    // a candidate that simply isn't in the spell index and gets dropped.
+    //
+    // "cantrip"/"cantrips" needs the exact same treatment as "spell" -- real
+    // D&D Beyond racial-trait prose grants cantrips just as often as leveled
+    // spells ("you know the Minor Illusion cantrip", "you know the Mending
+    // and Prestidigitation cantrips"), and without its own exclusion the
+    // repeated word group swallows it into the candidate the same way
+    // "spell" used to (e.g. "Minor Illusion Cantrip"), which then fails the
+    // index lookup below and silently drops the grant entirely (issue 021 --
+    // confirmed live on Elf's Elven Lineage, Gnome's Gnomish Lineage, and
+    // Tiefling's Otherworldly Presence/Infernal Legacy/Fiendish Legacy).
+    // Excluded from the repeated word group's negative lookahead and
+    // consumed by the trailing optional suffix alongside "spell".
+    //
+    // The plural, two-name shape ("the Mending and Prestidigitation
+    // cantrips") captures as a single "Mending and Prestidigitation"
+    // run -- the connector "and" isn't excluded from the repeated word
+    // group, same as it isn't for the multi-damage-type list traitRe
+    // splits further down. That combined string is never itself a real
+    // compendium entry, so it's split the same way traitRe's list is: try
+    // the whole candidate against the index first (the common single-name
+    // case), and only fall back to splitting on ", "/" and " when the whole
+    // string doesn't match, validating each piece against the index on its
+    // own so a genuine multi-name grant still resolves every name instead of
+    // the whole-string lookup failing and dropping all of them.
+    const castRe = /\b(?:casts?(?:ing)?|have|has|know|knows|learn|learns)\s+(?:the\s+)?((?:(?!spell\b|cantrips?\b)[A-Za-z][a-zA-Z']*\s*){1,4})(?:spell|cantrips?)?/g;
     let cm;
     while ((cm = castRe.exec(text))) {
       const candidate = cm[1].trim();
-      if (candidate && index.has(normalizeName(candidate)) && !spellNames.some((n) => normalizeName(n) === normalizeName(candidate))) {
-        spellNames.push(candidate);
+      if (!candidate) continue;
+      const pieces = index.has(normalizeName(candidate)) ? [candidate] : candidate.split(/\s*,\s*|\s+and\s+/i).map((p) => p.trim()).filter(Boolean);
+      for (const piece of pieces) {
+        if (index.has(normalizeName(piece)) && !spellNames.some((n) => normalizeName(n) === normalizeName(piece))) {
+          spellNames.push(piece);
+        }
       }
     }
   }
 
-  let usesFormula = null;
-  const modMatch = text.match(/\b(Strength|Dexterity|Constitution|Intelligence|Wisdom|Charisma)\s+modifier\b/i);
-  if (modMatch) {
-    usesFormula = `@abilities.${abilityCode(modMatch[1])}.mod`;
-  } else {
-    const numRe = new RegExp(`\\b(${Object.keys(NUMBER_WORDS).join("|")})\\s+times?\\b`, "i");
-    const numMatch = text.match(numRe);
-    if (numMatch) usesFormula = String(NUMBER_WORDS[numMatch[1].toLowerCase()]);
+  // Level-gated spell/cantrip grants: real D&D Beyond racial-trait prose
+  // often bundles two grants of different power into one trait -- an
+  // immediate cantrip plus a leveled spell that only becomes usable later
+  // ("You know the Produce Flame cantrip... Once you reach 3rd level, you
+  // can cast the Burning Hands spell..."). A "cast" Activity has no
+  // level-prerequisite field of its own in dnd5e's data model, so nothing
+  // downstream can enforce this unless the gate is detected here first --
+  // confirmed real bug: Fire Genasi's Reach to the Blaze let a 1st-level
+  // character cast Burning Hands with no restriction at all, because
+  // nothing ever extracted "3rd level" from the text even though the
+  // phrase itself was already recognized (just to avoid a false-positive
+  // uses-count match below, not to capture the level it names).
+  // Deliberately narrow to the handful of confirmed real DDB phrasings
+  // (same "once/when you reach Nth level" shape already referenced in the
+  // uses-count comment below, plus "starting/beginning at Nth level") --
+  // each spell name found above (whichever source: structural <a
+  // href="/spell:..."> link or the textual castRe fallback) is matched to
+  // the NEAREST preceding gate phrase in the raw text; a spell mentioned
+  // before every gate (or with no gate at all) stays ungated, same as
+  // before this detector existed.
+  const spellLevelGates = {};
+  if (spellNames.length) {
+    const gateRe = /\b(?:(?:once|when|after)\s+you\s+reach|starting\s+at|beginning\s+at)\s+(?:character\s+level\s+(\d+)\b|(\d+)(?:st|nd|rd|th)\s+level\b)/gi;
+    const gates = [];
+    let gmatch;
+    while ((gmatch = gateRe.exec(text))) {
+      const level = parseInt(gmatch[1] ?? gmatch[2], 10);
+      if (Number.isFinite(level)) gates.push({ index: gmatch.index, level });
+    }
+    if (gates.length) {
+      const lowerText = text.toLowerCase();
+      for (const spellName of spellNames) {
+        const nameIdx = lowerText.indexOf(spellName.toLowerCase());
+        if (nameIdx === -1) continue;
+        const gate = gates.filter((g) => g.index < nameIdx).sort((a, b) => b.index - a.index)[0];
+        if (gate) spellLevelGates[spellName] = gate.level;
+      }
+    }
   }
 
   const srIdx = text.search(/\bshort rest\b/i);
@@ -201,25 +503,111 @@ function scanSegmentText(text, spellNames, index) {
   if (srIdx !== -1 && (lrIdx === -1 || srIdx < lrIdx)) recoveryPeriod = "sr";
   else if (lrIdx !== -1) recoveryPeriod = "lr";
 
+  let usesFormula = null;
+  const modMatch = text.match(/\b(Strength|Dexterity|Constitution|Intelligence|Wisdom|Charisma)\s+modifier\b/i);
+  if (modMatch) {
+    usesFormula = `@abilities.${abilityCode(modMatch[1])}.mod`;
+  } else {
+    const numRe = new RegExp(`\\b(${Object.keys(NUMBER_WORDS).join("|")})\\s+times?\\b`, "i");
+    const numMatch = text.match(numRe);
+    if (numMatch) {
+      usesFormula = String(NUMBER_WORDS[numMatch[1].toLowerCase()]);
+    } else if (recoveryPeriod) {
+      // Bare "once"/"twice" (no "times" suffix) is the far more common D&D
+      // Beyond phrasing for a rest-recovered single/double use ("usable
+      // once per long rest") -- gated on an actual short/long-rest mention
+      // already found above so an unrelated temporal "once" ("once you
+      // reach 5th level") doesn't misfire into a spurious limited-use
+      // resource on a segment that just happens to also mention a rest.
+      const onceTwiceMatch = text.match(/\b(once|twice)\b/i);
+      if (onceTwiceMatch) usesFormula = onceTwiceMatch[1].toLowerCase() === "once" ? "1" : "2";
+    }
+  }
+
   let savingThrow = null;
   const saveMatch = text.match(/\b(Strength|Dexterity|Constitution|Intelligence|Wisdom|Charisma)\s+saving throw\b/i);
   if (saveMatch) {
+    const dcSpellcasting = /spell save DC/i.test(text);
     savingThrow = {
       ability: abilityCode(saveMatch[1]),
-      dcSpellcasting: /spell save DC/i.test(text),
+      dcSpellcasting,
+      dcFormula: dcSpellcasting ? null : parseDcFormula(text),
       onSaveHalf: /half\s*(?:as much|the)?\s*damage/i.test(text),
     };
   }
 
   const diceHints = [];
-  const diceRe = /(\d+d\d+(?:\s*[+-]\s*\d+)?)\s+([A-Za-z][A-Za-z ]{0,25}?)(?=[.,;]|\s+(?:and|or)\b|$)/gi;
+  // Ranges (as [start, end) character offsets into `text`) already fully
+  // accounted for by a merged dice+modifier formula below -- profRe further
+  // down skips any match inside one of these so the same "proficiency
+  // bonus" mention doesn't also produce a second, redundant flat hint.
+  const consumedRanges = [];
+
+  // A dice term optionally chained with one or more "+ <modifier>" clauses
+  // -- a literal number, an ability-modifier phrase, or a proficiency-bonus
+  // phrase (with an optional multiplier word) -- merged into ONE combined
+  // roll-data formula (issue 017) instead of the dice half and the
+  // modifier half being seen as two unrelated, independently-classified
+  // hints. Confirmed real misfire this fixes: Interception's "1d10 + your
+  // Proficiency Bonus" previously matched neither half correctly -- the
+  // old dice-only regex required a literal numeric modifier right after
+  // the dice term and simply failed to match the whole clause once a text
+  // term followed the "+", silently dropping the die and leaving only the
+  // flat "@prof" hint from profRe below.
+  const MODIFIER_TERM = "(?:\\d+|(?:your\\s+)?(?:Strength|Dexterity|Constitution|Intelligence|Wisdom|Charisma)\\s+modifier|(?:twice|double|half|three times|triple)?\\s*(?:your\\s+)?proficiency bonus)";
+  const diceRe = new RegExp(`(\\d+d\\d+(?:\\s*(?:\\+|plus)\\s*${MODIFIER_TERM})*)\\s+([A-Za-z][A-Za-z ]{0,25}?)(?=[.,;]|\\s+(?:and|or)\\b|$)`, "gi");
   let dm;
   while ((dm = diceRe.exec(text))) {
-    const formula = dm[1].replace(/\s+/g, "");
+    const formula = normalizeMergedFormula(dm[1]);
     const context = dm[2].trim().toLowerCase();
+    consumedRanges.push([dm.index, dm.index + dm[1].length]);
     if (/temporary hit points|temp hp/.test(context)) diceHints.push({ formula, kind: "heal", type: "temphp" });
     else if (/\bhit points\b|healing/.test(context)) diceHints.push({ formula, kind: "heal", type: "healing" });
     else diceHints.push({ formula, kind: "damage", type: DAMAGE_TYPE_WORDS.find((t) => context.includes(t)) ?? "" });
+  }
+
+  // A dice+modifier chain with NO classifying word after it -- the
+  // sentence's classifying word instead precedes the whole clause
+  // ("reduce the damage the target takes by 1d10 + your Proficiency
+  // Bonus.", the confirmed real Interception shape: diceRe above requires
+  // a trailing context word, which simply isn't there when the clause ends
+  // the sentence). Only fires when a modifier chain is actually present (a
+  // bare, unqualified dice mention with nothing classifying around it at
+  // all -- "roll 1d4 to determine the result" -- stays unclassified, same
+  // conservative behavior as before this fix applies), and only when the
+  // backward window contains an explicit classifying word -- same guard
+  // profRe below already uses, no silent "assume damage" default.
+  const diceWithModifierNoTrailingRe = new RegExp(`\\d+d\\d+(?:\\s*(?:\\+|plus)\\s*${MODIFIER_TERM})+`, "gi");
+  let dm2;
+  while ((dm2 = diceWithModifierNoTrailingRe.exec(text))) {
+    if (consumedRanges.some(([start, end]) => dm2.index >= start && dm2.index < end)) continue;
+    const context = text.slice(Math.max(0, dm2.index - 60), dm2.index).toLowerCase();
+    const formula = normalizeMergedFormula(dm2[0]);
+    consumedRanges.push([dm2.index, dm2.index + dm2[0].length]);
+    if (/temporary hit points|temp hp/.test(context)) diceHints.push({ formula, kind: "heal", type: "temphp" });
+    else if (/\bhit points\b|healing\b/.test(context)) diceHints.push({ formula, kind: "heal", type: "healing" });
+    else if (/\bdamage\b/.test(context)) diceHints.push({ formula, kind: "damage", type: DAMAGE_TYPE_WORDS.find((t) => context.includes(t)) ?? "" });
+  }
+
+  // Flat "(twice/half) your proficiency bonus" language — the same
+  // heal/damage/temp-hp classification as the dice-based hints above, but
+  // for a feature whose healing/damage scales with proficiency bonus alone
+  // (no dice notation anywhere in the clause), e.g. the 2024 Chef feat's
+  // "regain hit points equal to twice your proficiency bonus", which the
+  // dice-only diceRe above can't see at all. Unlike the dice case (where
+  // the unit word follows the number), the classifying word here normally
+  // comes BEFORE "proficiency bonus" ("regain hit points equal to...",
+  // "extra damage equals..."), so the context window looks backward.
+  const profRe = /\b(twice|double|half|three times|triple)?\s*(?:your\s+)?proficiency bonus\b/gi;
+  let pm;
+  while ((pm = profRe.exec(text))) {
+    if (consumedRanges.some(([start, end]) => pm.index >= start && pm.index < end)) continue;
+    const context = text.slice(Math.max(0, pm.index - 60), pm.index).toLowerCase();
+    const multiplier = { twice: " * 2", double: " * 2", half: " / 2", "three times": " * 3", triple: " * 3" }[pm[1]?.toLowerCase()] ?? "";
+    const formula = `@prof${multiplier}`;
+    if (/temporary hit points|temp hp/.test(context)) diceHints.push({ formula, kind: "heal", type: "temphp" });
+    else if (/\bhit points\b|healing\b/.test(context)) diceHints.push({ formula, kind: "heal", type: "healing" });
+    else if (/\bdamage\b/.test(context)) diceHints.push({ formula, kind: "damage", type: DAMAGE_TYPE_WORDS.find((t) => context.includes(t)) ?? "" });
   }
 
   // ActiveEffect-shaped language — each hint is already a plain {key, mode,
@@ -235,14 +623,38 @@ function scanSegmentText(text, spellNames, index) {
     ?? text.match(/(?:armor class|AC)\s+increases?\s+by\s+(\d+)/i);
   if (acMatch) effectHints.push({ key: "system.attributes.ac.bonus", mode: 2, value: acMatch[1] });
 
-  const traitRe = /\b(resistance|resistant|immunity|immune|vulnerability|vulnerable)\s+to\s+([a-z]+)\s+damage\b/gi;
+  // Two narrow, literal-phrase flat mechanics with confirmed real dnd5e
+  // Active Effect keys -- dice-free, so diceRe/profRe above can't see them.
+  // Deliberately anchored to their full confirmed phrasing (not just "hit
+  // point maximum increases" or "one size larger" alone) so a one-time,
+  // non-scaling HP bonus or an unrelated size mention elsewhere doesn't
+  // misfire.
+
+  // Dwarven Toughness: "Your hit point maximum increases by 1, and it
+  // increases by 1 again whenever you gain a level." The "whenever you
+  // gain a level" anchor (required, not just "increases by N") is what
+  // distinguishes this from a flat, one-time-only HP bonus elsewhere.
+  const hpPerLevelMatch = text.match(/hit point maximum increases by (\d+)\b[^.]*\bwhenever you gain a level\b/i);
+  if (hpPerLevelMatch) effectHints.push({ key: "system.attributes.hp.bonuses.level", mode: 2, value: hpPerLevelMatch[1] });
+
+  // Powerful Build: "You count as one size larger when determining your
+  // carrying capacity..." -- a boolean flag, no number to parse.
+  if (/\bcounts?\s+as\s+one\s+size\s+larger\b[^.]*\bcarrying capacity\b/i.test(text)) {
+    effectHints.push({ key: "flags.dnd5e.powerfulBuild", mode: 2, value: true });
+  }
+
+  // Captures a whole run of comma/"and"-joined words between "to" and
+  // "damage" (e.g. "Bludgeoning, Piercing, and Slashing damage"), not just a
+  // single type — connector words like "and" fall out naturally since
+  // they're not in DAMAGE_TYPE_WORDS.
+  const traitRe = /\b(resistance|resistant|immunity|immune|vulnerability|vulnerable)\s+to\s+((?:(?!damage\b)[a-z]+[,\s]+)*(?!damage\b)[a-z]+)\s+damage\b/gi;
   let trm;
   while ((trm = traitRe.exec(text))) {
-    const dtype = trm[2].toLowerCase();
-    if (!DAMAGE_TYPE_WORDS.includes(dtype)) continue;
     const kind = trm[1].toLowerCase();
     const key = /^resist/.test(kind) ? "system.traits.dr.value" : /^immun/.test(kind) ? "system.traits.di.value" : "system.traits.dv.value";
-    effectHints.push({ key, mode: 2, value: dtype });
+    for (const dtype of trm[2].toLowerCase().split(/[,\s]+/).filter(Boolean)) {
+      if (DAMAGE_TYPE_WORDS.includes(dtype)) effectHints.push({ key, mode: 2, value: dtype });
+    }
   }
 
   // Condition immunity — two independent patterns rather than one combined
@@ -252,28 +664,47 @@ function scanSegmentText(text, spellNames, index) {
   // "immune", two different targets). Requiring adjacency to "immune" would
   // only ever catch the first item in a list like that.
   //
-  // 2024 phrasing ("the <Condition> condition"): scanned whenever the
-  // segment mentions immune/immunity anywhere, not just directly before —
-  // trades a little precision (a "<condition> condition" mention far from
-  // any immunity language in the same segment would also match) for
-  // correctly handling shared-immune lists, consistent with this scanner's
-  // "starting point for review" philosophy elsewhere.
+  // 2024 phrasing ("the <Condition> condition"): scanned sentence-by-
+  // sentence whenever the segment mentions immune/immunity anywhere, not
+  // just directly before — trades a little precision (a "<condition>
+  // condition" mention in a different sentence than any immunity language
+  // would also match) for correctly handling shared-immune lists,
+  // consistent with this scanner's "starting point for review" philosophy
+  // elsewhere. Each candidate match is run through the same
+  // isGenuineSelfGrant guard the self-granted-condition detector below
+  // uses: without it, a condition mention from an unrelated save-or-suffer
+  // clause, or a self-referential "immune to this ability" (not "the X
+  // condition") mention, gets misread as a condition-immunity grant
+  // (confirmed real misfire: Infernal Dragoon).
   if (/\bimmun(?:e|ity)\b/i.test(text)) {
+    const immunitySentences = text.match(/[^.]+\.?/g) ?? [text];
     const conditionSuffixRe = /\b([a-z]+)\s+condition\b/gi;
-    let csm;
-    while ((csm = conditionSuffixRe.exec(text))) {
-      const condition = csm[1].toLowerCase();
-      if (CONDITION_WORDS.includes(condition)) effectHints.push({ key: "system.traits.ci.value", mode: 2, value: condition });
+    for (const sentence of immunitySentences) {
+      conditionSuffixRe.lastIndex = 0;
+      let csm;
+      while ((csm = conditionSuffixRe.exec(sentence))) {
+        const condition = csm[1].toLowerCase();
+        if (!CONDITION_WORDS.includes(condition)) continue;
+        const before = sentence.slice(0, csm.index).replace(/\([^)]*\)/g, "");
+        if (!isGenuineSelfGrant(before)) continue;
+        effectHints.push({ key: "system.traits.ci.value", mode: 2, value: condition });
+      }
     }
   }
 
   // 2014 phrasing ("immune to being Charmed") has no "condition" keyword to
-  // anchor on, so this one does require direct adjacency to "immune".
+  // anchor on, so this one does require direct adjacency to "immune" — same
+  // isGenuineSelfGrant guard applied for consistency with the 2024 case
+  // above (in practice this phrasing's own "before" text is always "...
+  // immune to being ", which never trips the guard).
   const immuneBeingRe = /\bimmune\s+to\s+being\s+([a-z]+)\b/gi;
   let ibm;
   while ((ibm = immuneBeingRe.exec(text))) {
     const condition = ibm[1].toLowerCase();
-    if (CONDITION_WORDS.includes(condition)) effectHints.push({ key: "system.traits.ci.value", mode: 2, value: condition });
+    if (!CONDITION_WORDS.includes(condition)) continue;
+    const before = text.slice(0, ibm.index).replace(/\([^)]*\)/g, "");
+    if (!isGenuineSelfGrant(before)) continue;
+    effectHints.push({ key: "system.traits.ci.value", mode: 2, value: condition });
   }
 
   // Self-granted condition ("You have the Invisible condition until...",
@@ -285,24 +716,138 @@ function scanSegmentText(text, spellNames, index) {
   // separately from effectHints/changes and doesn't need the immune guard.
   // Skipped when the segment already reads as immunity language so a single
   // "the Invisible condition" mention isn't double-counted as both.
+  //
+  // Scanned sentence-by-sentence (rather than over the whole segment) so
+  // the two guards below only ever look at the clause BEFORE one candidate
+  // match, not anything later in the same sentence — confirmed necessary
+  // against real D&D Beyond race trait text: Draconic Flight's own wings
+  // last "...until you retract the wings...or have the Incapacitated
+  // condition" (a duration-list terminator for an unrelated Fly Speed
+  // grant, not a status this trait gives its own possessor) and Celestial
+  // Revelation's Necrotic Shroud option reads "...must succeed on
+  // a...saving throw...or have the Frightened condition" (a save-or-suffer
+  // clause aimed at *other* creatures, not the trait holder) — both would
+  // otherwise have built a `transfer: true` effect that permanently slaps
+  // that status on whoever holds the trait. Checking only the text BEFORE
+  // the match (not the whole sentence) matters: Disappearing Step's own
+  // legitimate self-grant — "You have the Invisible condition until the
+  // start of your next turn or until you attack...or force a creature to
+  // make a saving throw" — mentions "saving throw" too, just later, after
+  // ending an unrelated clause about when the invisibility itself ends.
+  // A Reaction/Bonus-Action-gated grant ("you can take a Reaction to gain
+  // the Invisible condition until...", e.g. Fey Sentinel) is a genuine
+  // self-grant, but conditional on the player actually triggering it --
+  // captured separately here (built as a transfer:false toggle effect with
+  // a real duration, same shape as the shipped Stonecunning item) and
+  // excluded from the plain statusHints scan below so the same condition
+  // isn't also built as a second, permanent effect.
+  const toggleStatusHints = [];
+  const toggleGrantRe = /\byou can take a (?:reaction|bonus action) to (?:gain|give yourself)\s+(?:the\s+)?([a-z]+)\s+condition\b/gi;
+  let tgm;
+  while ((tgm = toggleGrantRe.exec(text))) {
+    const condition = tgm[1].toLowerCase();
+    if (!CONDITION_WORDS.includes(condition)) continue;
+    // "until the start of your next turn" is the confirmed real phrasing
+    // (Fey Sentinel) -- simplified to a single round rather than doing full
+    // turn-tracking, which isn't the point here; any other duration
+    // phrasing gets the same 1-round simplification rather than guessing
+    // at unfamiliar wording.
+    if (!toggleStatusHints.some((h) => h.condition === condition)) {
+      toggleStatusHints.push({ condition, durationType: "rounds", durationValue: 1 });
+    }
+  }
+
   const statusHints = [];
   if (!/\bimmun(?:e|ity)\b/i.test(text)) {
+    const sentences = text.match(/[^.]+\.?/g) ?? [text];
     const grantRe = /\b(?:have|has|gain|gains|gaining|are|become|becomes)\s+(?:the\s+)?([a-z]+)\s+condition\b/gi;
-    let gsm;
-    while ((gsm = grantRe.exec(text))) {
-      const condition = gsm[1].toLowerCase();
-      if (CONDITION_WORDS.includes(condition) && !statusHints.includes(condition)) statusHints.push(condition);
+    for (const sentence of sentences) {
+      grantRe.lastIndex = 0;
+      let gsm;
+      while ((gsm = grantRe.exec(sentence))) {
+        const before = sentence.slice(0, gsm.index).replace(/\([^)]*\)/g, "");
+        if (!isGenuineSelfGrant(before)) continue;
+        const condition = gsm[1].toLowerCase();
+        if (!CONDITION_WORDS.includes(condition)) continue;
+        // Already captured above as a reaction/bonus-action-gated toggle
+        // grant -- don't also build a second, permanent effect for it.
+        if (toggleStatusHints.some((h) => h.condition === condition)) continue;
+        if (!statusHints.includes(condition)) statusHints.push(condition);
+      }
     }
   }
 
   const speedMatch = text.match(/\b(walking|climbing|swimming|flying|burrowing)?\s*speed\s+increases?\s+by\s+(\d+)\s*feet/i);
   if (speedMatch) {
-    const movementKey = { walking: "walk", climbing: "climb", swimming: "swim", flying: "fly", burrowing: "burrow" }[(speedMatch[1] ?? "walking").toLowerCase()] ?? "walk";
+    const movementKey = MOVEMENT_KEY_BY_WORD[(speedMatch[1] ?? "walking").toLowerCase()] ?? "walk";
     effectHints.push({ key: `system.attributes.movement.${movementKey}`, mode: 2, value: speedMatch[2] });
   }
 
-  const darkvisionMatch = text.match(/darkvision(?:\s+(?:out to|to|of)\s+(?:a range of\s+)?)?\s*(\d+)\s*feet/i);
+  // "Increases to N feet" is a second delta form -- a target value, not an
+  // added amount (confirmed real phrasing: Fleet of Foot's "Your base
+  // walking speed increases to 35 feet") -- so it's moded as an UPGRADE (4)
+  // rather than ADD (2), the same convention darkvision below uses for its
+  // own stated-absolute-value grant: only applies if it's better than
+  // what's already there.
+  const speedToMatch = text.match(/\b(walking|climbing|swimming|flying|burrowing)?\s*speed\s+increases?\s+to\s+(\d+)\s*feet/i);
+  if (speedToMatch) {
+    const movementKey = MOVEMENT_KEY_BY_WORD[(speedToMatch[1] ?? "walking").toLowerCase()] ?? "walk";
+    effectHints.push({ key: `system.attributes.movement.${movementKey}`, mode: 4, value: speedToMatch[2] });
+  }
+
+  // Absolute speed grant ("you have a walking/climbing/swimming/flying/
+  // burrowing speed of N feet", confirmed missing on Flight and Swim
+  // traits) -- distinct from the delta forms above (this states the whole
+  // speed outright rather than adding to or overriding an existing one),
+  // but built with the same ADD-mode shape as the "increases by" delta
+  // form above.
+  const speedAbsoluteMatch = text.match(/\byou have a (walking|climbing|swimming|flying|burrowing)\s+speed of\s+(\d+)\s*feet/i);
+  if (speedAbsoluteMatch) {
+    const movementKey = MOVEMENT_KEY_BY_WORD[speedAbsoluteMatch[1].toLowerCase()] ?? "walk";
+    effectHints.push({ key: `system.attributes.movement.${movementKey}`, mode: 2, value: speedAbsoluteMatch[2] });
+  }
+
+  // Two independent phrasings both grant darkvision in real D&D Beyond
+  // text: the short form ("You have Darkvision with a range of 60 feet.")
+  // and the 2024 PHB's own standardized boilerplate ("You can see in dim
+  // light within 60 feet of you as if it were bright light, and in
+  // darkness as if it were dim light...", verified identical word-for-word
+  // across multiple real species traits) — the latter never mentions the
+  // word "darkvision" anywhere near the actual number, so the short-form
+  // regex alone can't catch it; trusted the same way the 2024 Ability
+  // Score Increase boilerplate already is (see guessAbilityScoreImprovement)
+  // since it's fixed, real official wording, not a loose guess.
+  const darkvisionMatch = text.match(/darkvision(?:\s+(?:out to|with|to|of|radius of)\s+(?:a range of\s+)?)?\s*(\d+)\s*feet/i)
+    // "Darkvision has a radius of 120 feet" (confirmed on Superior
+    // Darkvision) -- a verb+article construction the connector alternation
+    // above (prepositions only) can't reach.
+    ?? text.match(/darkvision\s+has\s+a\s+(?:radius|range)\s+of\s+(\d+)\s*feet/i)
+    ?? text.match(/\bsee in dim light within\s+(\d+)\s*feet\s+of you as if it were bright light/i);
   if (darkvisionMatch) effectHints.push({ key: "system.attributes.senses.darkvision", mode: 4, value: darkvisionMatch[1] });
+
+  // Blindsight/Truesight — same verified-safe "system.attributes.senses.*"
+  // shape as darkvision above (confirmed against real dnd5e-shipped items:
+  // Devil's Sight/Witch Sight/Boon of Truesight all upgrade darkvision or
+  // truesight; Feral Senses adds blindsight — matched here by using "add"
+  // for blindsight and "upgrade" for truesight, same split). Only for a
+  // permanent, passive grant, though: a sense granted "as a Bonus Action"
+  // for a fixed duration (Stonecunning's own Tremorsense — confirmed
+  // transfer:false with a real 10-minute duration on the real shipped
+  // item, nothing like a permanent trait) is a completely different shape
+  // this scanner can't safely build — a blanket permanent effect here
+  // would repeat Draconic Flight's mistake, so nearby activation/duration
+  // language suppresses the match instead of guessing wrong.
+  for (const [sense, mode] of [["blindsight", 2], ["truesight", 4]]) {
+    const senseMatch = text.match(new RegExp(`\\b${sense}(?:\\s+(?:out to|with|to|of|radius of)\\s+(?:a range of\\s+)?)?\\s*(\\d+)\\s*feet`, "i"))
+      // Same verb+article "has a radius/range of N feet" construction as
+      // darkvision above.
+      ?? text.match(new RegExp(`\\b${sense}\\s+has\\s+a\\s+(?:radius|range)\\s+of\\s+(\\d+)\\s*feet`, "i"));
+    if (!senseMatch) continue;
+    const window = 80;
+    const around = text.slice(Math.max(0, senseMatch.index - window), senseMatch.index + senseMatch[0].length + window);
+    if (/\bbonus action\b|\bas an action\b|\bfor\s+\d+\s*(?:minutes?|hours?|rounds?)\b/i.test(around)) continue;
+    effectHints.push({ key: `system.attributes.senses.${sense}`, mode, value: senseMatch[1] });
+  }
 
   // Multiple detectors above can independently land on the same
   // key+value (e.g. both condition-immunity patterns matching the same
@@ -310,13 +855,16 @@ function scanSegmentText(text, spellNames, index) {
   // redundant duplicate change.
   const seenHints = new Set();
   const dedupedEffectHints = effectHints.filter((h) => {
-    const dedupeKey = `${h.key} ${h.value}`;
+    const dedupeKey = `${h.key}\x00${h.value}`;
     if (seenHints.has(dedupeKey)) return false;
     seenHints.add(dedupeKey);
     return true;
   });
 
-  return { usesFormula, recoveryPeriod, savingThrow, diceHints, effectHints: dedupedEffectHints, statusHints };
+  const activation = parseActivation(text);
+  const { range, target } = parseRangeAndTarget(text);
+
+  return { usesFormula, recoveryPeriod, savingThrow, diceHints, effectHints: dedupedEffectHints, statusHints, toggleStatusHints, activation, range, target, spellLevelGates };
 }
 
 // Best-guess mechanics scanner for a scraped feature's prose (used by the
@@ -384,26 +932,193 @@ export function guessFeatureMechanics(descriptionHtml, index = null) {
   return { segments };
 }
 
+// 2024 rules standardized "Ability Score Increase" onto three fixed
+// boilerplate phrasings across every half-feat, the flat "Ability Score
+// Improvement" feat, and every Epic Boon — verified against dnd5e's own
+// shipped feats24 pack (e.g. Grappler: "Increase your Strength or Dexterity
+// score by 1, to a maximum of 20."; the ASI feat itself: "Increase one
+// ability score of your choice by 2, or increase two ability scores of your
+// choice by 1."; Boon of Combat Prowess: "Increase one ability score of
+// your choice by 1, to a maximum of 30."). Real official text, not scraped
+// prose guesswork, so unlike guessFeatureMechanics' effect/activity
+// detectors this is trusted enough to build an advancement entry directly
+// rather than just a review hint. Returns null when the description
+// doesn't contain this exact family of phrasing — never a guessed partial
+// match — since a wrong ASI advancement (wrong abilities locked, wrong
+// point cap) is worse than a feat that simply has none built yet.
+function guessAbilityScoreImprovement(descriptionHtml) {
+  if (!descriptionHtml) return null;
+  const text = descriptionHtml.replace(/<[^>]+>/g, " ").replace(/&amp;/gi, "&").replace(/\s+/g, " ");
+  const sentence = text.match(/Increase\s+(?:your|one ability score of your choice|two ability scores of your choice)[^.]*\./i)?.[0];
+  if (!sentence) return null;
+
+  const maxMatch = sentence.match(/maximum of (\d+)/i);
+  const max = maxMatch ? Number(maxMatch[1]) : null;
+  const asiConfig = (points, cap, locked) => ({
+    cap, points, locked, max,
+    fixed: { str: 0, dex: 0, con: 0, int: 0, wis: 0, cha: 0 },
+  });
+
+  // "Increase one ability score of your choice by 2, or increase two
+  // ability scores of your choice by 1." — dnd5e's own AbilityScoreImprovement
+  // advancement already represents "one by 2, or two by 1" as a single
+  // 2-point pool capped at 2 per ability, so this maps directly with
+  // nothing locked out.
+  if (/two ability scores of your choice by 1\b/i.test(sentence)) return asiConfig(2, 2, []);
+
+  const namedAbilities = [...new Set([...sentence.matchAll(/\b(Strength|Dexterity|Constitution|Intelligence|Wisdom|Charisma)\b/gi)].map((m) => abilityCode(m[1])))];
+  const amount = Number(sentence.match(/\bby\s+(\d+)\b/i)?.[1] ?? 1);
+
+  if (namedAbilities.length) {
+    const locked = Object.values(ABILITY_CODES).filter((c) => !namedAbilities.includes(c));
+    return asiConfig(amount, amount, locked);
+  }
+  if (/one ability score of your choice/i.test(sentence)) return asiConfig(amount, amount, []);
+  return null;
+}
+
+// Wraps guessAbilityScoreImprovement's raw configuration in the same
+// {_id, type, configuration, value, level, title, hint} advancement-entry
+// shape used everywhere else in this module (see buildAdvancement,
+// ddb-scraper.mjs's buildRaceAdvancement) — level 0 since a feat's own ASI
+// applies the moment it's taken, matching dnd5e's own shipped feats24 items.
+export function guessAbilityScoreAdvancement(descriptionHtml) {
+  const configuration = guessAbilityScoreImprovement(descriptionHtml);
+  if (!configuration) return null;
+  const id = randomId();
+  return { [id]: { _id: id, type: "AbilityScoreImprovement", configuration, value: {}, level: 0, title: "", hint: "" } };
+}
+
+// "You gain proficiency with cook's utensils" (the 2024 Chef feat, among
+// many others) is common enough boilerplate to reuse the exact same
+// tool-name/category parsing a class's own "Tool Proficiencies" table row
+// already goes through (parseProficiencyClause/parseToolProficiencies),
+// plus weapon/armor/skill/language vocabulary for the many other shapes a
+// feat/trait/species uses instead of a table. Unlike guessFeatureMechanics'
+// effect/activity detectors (queued for review — a wrong Effect could
+// misinform play), a Trait advancement is purely additive: the worst case
+// is nothing gets detected, never a wrong grant silently applied, so this
+// is trusted at the same level guessAbilityScoreAdvancement already is —
+// built directly from real feat/trait text, not queued. Kept independent
+// of guessFeatureMechanics' segment-based scan (used by the interactive
+// Build Feature dialog too) so a feat/trait imported straight from D&D
+// Beyond gets this without entangling it in that dialog's own
+// effect/activity queue UI.
+//
+// This function only finds proficiency/training/language-grant *clauses* in
+// the prose; parseProficiencyClause (below) owns interpreting what's inside
+// one already-isolated clause.
+export function guessProficiencyAdvancement(descriptionHtml) {
+  if (!descriptionHtml) return {};
+  const text = descriptionHtml.replace(/<[^>]+>/g, " ").replace(/&amp;/gi, "&").replace(/\s+/g, " ");
+
+  const grants = [];
+  const choices = [];
+  // Stops at a trailing conditional clause, not just sentence end — real
+  // D&D Beyond text (e.g. Chef's own "proficiency with cook's utensils IF
+  // YOU DON'T ALREADY HAVE IT") tacks one on often enough that capturing
+  // straight to the period would feed parseProficiencyClause a string that
+  // never exact-matches any known tool/skill name. Also triggers on "gain
+  // training with X" — the real 2024 phrasing armor grants (Heavily
+  // Armored, Moderately Armored, etc.) use instead of the word
+  // "proficiency".
+  const clauseRe = /\b(?:proficiency\s+(?:with|in)|gains?\s+training\s+with)\s+([^.;]+?)(?=[.;]|\s+if\b|\s+when\b|\s+unless\b|\s+provided\b|$)/gi;
+  let cm;
+  while ((cm = clauseRe.exec(text))) {
+    const { grants: clauseGrants, choices: clauseChoices } = parseProficiencyClause(cm[1]);
+    grants.push(...clauseGrants);
+    choices.push(...clauseChoices);
+  }
+
+  // The 2024 PHB's "you learn to speak, read, and write X" language-grant
+  // boilerplate (e.g. Rune Knight's Bonus Proficiencies) never contains the
+  // word "proficiency" or "training" above, so it's structurally invisible
+  // to clauseRe — it needs its own independent clause-finder feeding into
+  // the same grants list.
+  const languageRe = /\bspeak,?\s*read,?\s*(?:and|&)\s*write\s+([^.;]+?)(?=[.;]|\s+if\b|\s+when\b|\s+unless\b|\s+provided\b|$)/gi;
+  let lm;
+  while ((lm = languageRe.exec(text))) grants.push(...parseLanguageGrants(lm[1]));
+
+  const uniqueGrants = [...new Set(grants)];
+  if (!uniqueGrants.length && !choices.length) return {};
+
+  const id = randomId();
+  return {
+    [id]: {
+      _id: id, type: "Trait",
+      configuration: { mode: "default", allowReplacements: false, grants: uniqueGrants, choices },
+      value: { chosen: [] }, level: 0, title: "", hint: "", flags: {},
+    },
+  };
+}
+
 function abilityCode(name) {
   return ABILITY_CODES[name.trim().toLowerCase()] ?? null;
 }
 
+// Strips a leading "the" and a trailing "skill(s)" before the exact-match
+// lookup — real D&D Beyond phrasing like "proficiency in the Deception
+// skill" would otherwise never match SKILL_CODES' bare "deception" key.
 function skillCode(name) {
-  return SKILL_CODES[name.trim().toLowerCase().replace(/\.$/, "")] ?? null;
+  const cleaned = name.trim().replace(/^the\s+/i, "").replace(/\s+skills?$/i, "").replace(/\.$/, "").toLowerCase();
+  return SKILL_CODES[cleaned] ?? null;
 }
 
 function normalizeApostrophes(s) {
   return s.replace(/[‘’]/g, "'");
 }
 
+// Strips a leading "the" before the exact-match lookup — real D&D Beyond
+// phrasing like "proficiency with the Poisoner's Kit" would otherwise never
+// match TOOL_CODES' bare "poisoner's kit" key.
 function toolCode(name) {
-  const key = normalizeApostrophes(name.trim().toLowerCase()).replace(/\.$/, "");
+  const key = normalizeApostrophes(name.trim()).replace(/^the\s+/i, "").replace(/\.$/, "").toLowerCase();
   return TOOL_CODES[key] ?? null;
+}
+
+function languageCode(name) {
+  const key = normalizeApostrophes(name.trim()).replace(/^the\s+/i, "").replace(/\.$/, "").toLowerCase();
+  return LANGUAGE_CODES[key] ?? null;
+}
+
+// Reads a leading number word ("three") or digit ("3") off the front of a
+// string, e.g. for "three different Artisan's Tools of your choice" or
+// "2 skills of your choice" — returns null (not 1) when nothing numeric
+// leads the string, so callers can tell "no stated count" apart from an
+// explicit "one"/"1" and choose their own default.
+function parseCountWord(token) {
+  if (!token) return null;
+  const t = token.trim().toLowerCase();
+  if (/^\d+$/.test(t)) return parseInt(t, 10);
+  return NUMBER_WORDS[t] ?? null;
+}
+
+// e.g. "Giant" or "Giant and Draconic" -> ["languages:standard:giant", ...]
+function parseLanguageGrants(namesText) {
+  const grants = [];
+  if (!namesText) return grants;
+  const pieces = normalizeApostrophes(namesText)
+    .split(/,\s*|\s+and\s+|\s+or\s+/i)
+    .map((s) => s.replace(/^(?:and|or)\s+/i, "").trim())
+    .filter(Boolean);
+  for (const piece of pieces) {
+    const code = languageCode(piece);
+    if (code) grants.push(code);
+  }
+  return grants;
 }
 
 // e.g. "Thieves' Tools, Tinker's Tools, and one type of Artisan's Tools of
 // your choice" -> grants: ["tool:thief","tool:tinker"], choices: [{count:1,pool:["tool:art"]}]
-function parseToolProficiencies(toolsText) {
+// A leading number word/digit on a tool-category segment ("three different
+// Artisan's Tools of your choice") sets that choice's count instead of the
+// count always defaulting to 1 (Crafter, Musician).
+//
+// Kept as its own function (rather than folded entirely into
+// parseProficiencyClause) since buildAdvancement's "Tool Proficiencies"
+// class-table row also calls this directly with a plain tool list and no
+// skill/weapon/armor/language vocabulary to consider.
+export function parseToolProficiencies(toolsText) {
   const grants = [];
   const choices = [];
   if (!toolsText) return { grants, choices };
@@ -416,7 +1131,9 @@ function parseToolProficiencies(toolsText) {
   for (const seg of segments) {
     const category = TOOL_CATEGORY_WORDS.find(([re]) => re.test(seg));
     if (category) {
-      choices.push({ count: 1, pool: [`tool:${category[1]}`] });
+      const leadWord = seg.match(/^(\d+|[a-z]+)\b/i);
+      const count = leadWord ? parseCountWord(leadWord[1]) : null;
+      choices.push({ count: count ?? 1, pool: [`tool:${category[1]}`] });
       continue;
     }
     const code = toolCode(seg);
@@ -424,6 +1141,91 @@ function parseToolProficiencies(toolsText) {
   }
 
   return { grants, choices };
+}
+
+// Interprets one already-isolated proficiency/training clause (the text
+// after "proficiency with/in" or "gain training with", with no surrounding
+// sentence) and returns the Trait advancement grants/choices it describes.
+// Covers, in order:
+//   1. Weapon categories (weapon:sim/mar) and armor categories
+//      (armor:lgt/med/hvy/shl) — ported from buildAdvancement's own
+//      Weapon Proficiencies/Armor Training table-row logic so the
+//      prose-based detector uses the exact same vocabulary.
+//   2. Open/unnamed "N skill(s) of your choice" and "any combination of N
+//      skills or tools of your choice" — wildcard pools (skills:*, tool:*),
+//      matching the real shape dnd5e's own Human "Skillful" trait uses.
+//   3. Tool names/categories (delegated to parseToolProficiencies).
+//   4. Skill names, with "X or Y" producing a choose-N choice (default
+//      count 1, or the clause's stated count e.g. "two of the following")
+//      and "X and Y" producing unconditional grants — plus the same
+//      leading-"the"/trailing-"skill(s)" wrapper stripping as skillCode.
+export function parseProficiencyClause(clauseRaw) {
+  const grants = [];
+  const choices = [];
+  if (!clauseRaw) return { grants, choices };
+  const clause = normalizeApostrophes(clauseRaw).trim();
+
+  // --- Weapon / armor category vocabulary (ported from buildAdvancement) --
+  if (/\bweapons?\b/i.test(clause) && (/\bsimple\b/i.test(clause) || /\bmartial\b/i.test(clause))) {
+    const weaponGrants = [];
+    if (/\bsimple\b/i.test(clause)) weaponGrants.push("weapon:sim");
+    if (/\bmartial\b/i.test(clause)) weaponGrants.push("weapon:mar");
+    return { grants: weaponGrants, choices: [] };
+  }
+  if (/\barmor\b/i.test(clause) || /\bshields?\b/i.test(clause)) {
+    const armorGrants = [];
+    if (/\blight\b/i.test(clause)) armorGrants.push("armor:lgt");
+    if (/\bmedium\b/i.test(clause)) armorGrants.push("armor:med");
+    if (/\bheavy\b/i.test(clause)) armorGrants.push("armor:hvy");
+    if (/\bshields?\b/i.test(clause)) armorGrants.push("armor:shl");
+    if (armorGrants.length) return { grants: armorGrants, choices: [] };
+  }
+
+  // --- Open/unnamed "of your choice" wildcard grants -----------------------
+  const comboMatch = clause.match(/\bany combination of\s+(\w+)\s+skills?\s+or\s+tools?\b/i);
+  if (comboMatch) {
+    return { grants: [], choices: [{ count: parseCountWord(comboMatch[1]) ?? 1, pool: ["skills:*", "tool:*"] }] };
+  }
+  const skillWildcardMatch = clause.match(/^(\w+)\s+skills?\s+of your choice\b/i);
+  if (skillWildcardMatch) {
+    return { grants: [], choices: [{ count: parseCountWord(skillWildcardMatch[1]) ?? 1, pool: ["skills:*"] }] };
+  }
+
+  // --- Tool names / categories ---------------------------------------------
+  const { grants: toolGrants, choices: toolChoices } = parseToolProficiencies(clause);
+  grants.push(...toolGrants);
+  choices.push(...toolChoices);
+
+  // --- Skill names: "or" -> choice, "and"/plain -> grants -------------------
+  let skillSection = clause;
+  let explicitCount = null;
+  const followingMatch = skillSection.match(/\b(\w+)\s+of the following(?:\s+skills?)?(?:\s+of your choice)?:?\s*/i);
+  if (followingMatch) {
+    explicitCount = parseCountWord(followingMatch[1]);
+    skillSection = skillSection.slice(followingMatch.index + followingMatch[0].length);
+  }
+  skillSection = skillSection.replace(/\(your choice\)/gi, "").replace(/\bof your choice\b/gi, "");
+
+  const hasOr = /\bor\b/i.test(skillSection);
+  const hasAnd = /\band\b/i.test(skillSection);
+  const isChoiceList = hasOr && !hasAnd;
+  const pieces = skillSection
+    .split(isChoiceList ? /,\s*|\s+or\s+/i : /,\s*|\s+and\s+/i)
+    .map((s) => s.replace(/^(?:and|or)\s+/i, "").trim())
+    .filter(Boolean);
+
+  const skillCodes = [];
+  for (const piece of pieces) {
+    const code = skillCode(piece);
+    if (code) skillCodes.push(`skills:${code}`);
+  }
+
+  if (skillCodes.length) {
+    if (isChoiceList) choices.push({ count: explicitCount ?? 1, pool: [...new Set(skillCodes)] });
+    else grants.push(...skillCodes);
+  }
+
+  return { grants: [...new Set(grants)], choices };
 }
 
 function text(el) {
@@ -997,6 +1799,64 @@ function baseStats() {
   };
 }
 
+// Companion to parseSubclassContent's own feature-detail capture — a
+// wikidot class page numbers its own class features with the identical
+// "Level N: Name" H3 convention a subclass page's features do (confirmed
+// against dnd2024.wikidot.com/artificer:main's own "Level 1: Spellcasting"
+// heading), so a class feature's FIXME name-lookup can offer the same
+// "create from the source's own text" fallback a subclass feature's
+// already could — before this, scrapeClass built no featureDetails at
+// all, so a class feature with no real compendium match under this class
+// (Artificer's own "Spellcasting" chief among them — dnd5e's free SRD
+// packs don't ship Artificer, so the lookup only ever turns up some other
+// class's same-named-but-different feature) had no fallback and the
+// review dialog could only offer that wrong cross-class candidate.
+// parseFeatureTables already gives level->name and any scale columns off
+// the page's own Features table, which sits entirely before the first
+// "Level N:" heading — so unlike parseSubclassContent (which has to
+// special-case its own embedded spell-grant tables mid-walk), this only
+// needs each feature's own prose underneath its heading, with no table
+// branching required.
+function parseClassFeatureDetails(content) {
+  const featureDetails = [];
+  let activeFeature = null;
+
+  const finalizeActiveFeature = () => {
+    if (activeFeature) {
+      featureDetails.push({
+        level: activeFeature.level,
+        name: activeFeature.name,
+        descriptionHtml: activeFeature.blocks.map((el) => el.outerHTML).join(""),
+      });
+    }
+  };
+
+  for (const el of Array.from(content.children)) {
+    const tag = el.tagName;
+    // A new top-level section (e.g. a class page's own trailing notes past
+    // its last numbered feature) ends the run of per-feature prose, same
+    // as the "Becoming an X"/Core Traits content before the first "Level
+    // N:" heading is already skipped (activeFeature stays null until then).
+    if (tag === "H1" || tag === "H2") {
+      finalizeActiveFeature();
+      activeFeature = null;
+      continue;
+    }
+    if (tag === "H3") {
+      const m = text(el).replace(/\s+/g, " ").match(LEVEL_HEADING);
+      if (m) {
+        finalizeActiveFeature();
+        activeFeature = { level: parseInt(m[1], 10), name: m[2].trim(), blocks: [] };
+        continue;
+      }
+    }
+    activeFeature?.blocks.push(el);
+  }
+  finalizeActiveFeature();
+
+  return featureDetails;
+}
+
 function scrapeClass(doc, content) {
   const className = text(doc.querySelector(".breadcrumbs")).split("»").pop().trim()
     || text(doc.querySelector("title")).split(" - ")[0].trim();
@@ -1005,6 +1865,7 @@ function scrapeClass(doc, content) {
   const { traits, tableHtml } = parseCoreTraits(content, className);
   const becomingHtml = buildBecomingHtml(content, className);
   const { featuresByLevel, scaleColumns, maxSpellSlotLevel, hasPactColumn, hasSpellSlots } = parseFeatureTables(content);
+  const featureDetails = parseClassFeatureDetails(content);
   const hasSpellcasting = hasSpellSlots;
   const spellAbility = hasSpellcasting ? findSpellcastingAbility(content) : null;
   const identifier = slugify(className);
@@ -1061,7 +1922,13 @@ function scrapeClass(doc, content) {
     ownership: { default: 0 },
   };
 
-  return { type: "class", item };
+  // `className` wasn't returned before — importer.mjs's createItemFromData
+  // uses it both to file the class into its own class-named folder (as the
+  // DDB class-import path already does via classFolderSegments) and, via
+  // resolveItemUuids's `expectedClass`, to scope this class's own named
+  // features' FIXME lookups to compendium entries actually filed under
+  // this class rather than any same-named feature from another one.
+  return { type: "class", item, className, featureDetails };
 }
 
 // Shared by both the wikidot subclass path and the freeform-doc path (see
@@ -1070,6 +1937,7 @@ function scrapeClass(doc, content) {
 export function assembleSubclassItem({ name, classIdentifier, className, descriptionHtml, featuresByLevel, spellGrants, scaleColumns }) {
   const identifier = deriveSubclassIdentifier(name);
   const advancement = buildSubclassAdvancement({ featuresByLevel, spellGrants, scaleColumns });
+  const spellcastingOverride = SUBCLASS_SPELLCASTING_OVERRIDES[identifier];
 
   const item = {
     _id: randomId(),
@@ -1083,7 +1951,9 @@ export function assembleSubclassItem({ name, classIdentifier, className, descrip
       identifier,
       classIdentifier: classIdentifier ?? "",
       advancement,
-      spellcasting: { progression: "none", ability: "", preparation: { formula: "" } },
+      spellcasting: spellcastingOverride
+        ? { progression: spellcastingOverride.progression, ability: spellcastingOverride.ability, preparation: { formula: "" } }
+        : { progression: "none", ability: "", preparation: { formula: "" } },
     },
     effects: [],
     flags: {},
