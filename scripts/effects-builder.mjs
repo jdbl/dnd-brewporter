@@ -878,6 +878,15 @@ function guessQueueEntries(descriptionHtml, index, preference, featureName = "",
       if (!match) continue;
       entries.push({
         kind: "activity", guessed: true,
+        // Set when this specific spell's own grant was gated behind a later
+        // character level in the source text (e.g. "once you reach 3rd
+        // level") — see scanSegmentText's spellLevelGates. Carried as a
+        // sibling of `data`, not inside it: a "cast" Activity has no level-
+        // prerequisite field in dnd5e's schema, so this is metadata for a
+        // caller that can act on it (buildAutoMechanics/importDdbRace), not
+        // part of the Activity document itself.
+        levelGate: seg.spellLevelGates?.[spellName] ?? null,
+        spellName: match.name,
         data: buildActivityData("cast", {
           // activationType here defaults to plain "action" (a spell grant
           // usually just is one), but now defers to whatever the segment's
@@ -994,7 +1003,24 @@ export function buildAutoMechanics(descriptionHtml, index, featureName = "", { s
   const { entries } = guessQueueEntries(descriptionHtml, index, rulesetPreference(), featureName, { preserveUnmatchedLabels: false });
   return {
     effects: entries.filter((q) => q.kind === "effect").map((q) => q.data),
+    // Still includes any level-gated "cast" activity below (see
+    // leveledActivities) so nothing changes for a caller that doesn't read
+    // that field — a feat/background feature has no per-item mechanism to
+    // grant something separately at a later level, so it just keeps the
+    // (ungated) activity here exactly as it always has.
     activities: Object.fromEntries(entries.filter((q) => q.kind === "activity").map((q) => [q.data._id, q.data])),
+    // A "cast" activity whose own spell grant was gated behind a later
+    // character level in the source text (e.g. Fire Genasi's Reach to the
+    // Blaze: Produce Flame immediately, Burning Hands only "once you reach
+    // 3rd level" — see scanSegmentText's spellLevelGates). importDdbRace is
+    // the only caller that acts on this: a race trait is already granted at
+    // its own level via traitsByLevel/ItemGrant, so it pulls the matching
+    // activity back out of `activities` above and rebuilds it as its own
+    // small item granted at `level` instead, since a "cast" Activity has no
+    // level-prerequisite field of its own to enforce this on the same item.
+    leveledActivities: entries
+      .filter((q) => q.kind === "activity" && q.levelGate)
+      .map((q) => ({ level: q.levelGate, spellName: q.spellName, activityId: q.data._id })),
     // Independent of the segment-based queue above (see
     // guessProficiencyAdvancement) — a tool/skill proficiency grant like
     // Chef's own cook's-utensils, plus the standard 2024 Ability Score
@@ -1021,7 +1047,7 @@ export function showBuildFeatureDialog({ name, index, descriptionHtml = "" }) {
 
     const queueRowHtml = (item, i) => `
       <div class="wikidot-eb-queue-row" data-idx="${i}">
-        <span>${item.kind === "effect" ? "Effect" : `Activity (${ACTIVITY_TYPE_LABELS[item.data.type] ?? item.data.type})`}: <strong>${item.data.name || "(unnamed)"}</strong>${item.guessed ? ` <em>(auto-guess — review before creating)</em>` : ""}</span>
+        <span>${item.kind === "effect" ? "Effect" : `Activity (${ACTIVITY_TYPE_LABELS[item.data.type] ?? item.data.type})`}: <strong>${item.data.name || "(unnamed)"}</strong>${item.guessed ? ` <em>(auto-guess — review before creating)</em>` : ""}${item.levelGate ? ` <em>(text suggests this requires character level ${item.levelGate} — dnd5e has no per-activity level gate, so grant it as a separate item at that level instead)</em>` : ""}</span>
         <button type="button" class="wikidot-eb-remove-queued" data-idx="${i}">Remove</button>
       </div>
     `;

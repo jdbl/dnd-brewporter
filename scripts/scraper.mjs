@@ -457,6 +457,46 @@ export function scanSegmentText(text, spellNames, index) {
     }
   }
 
+  // Level-gated spell/cantrip grants: real D&D Beyond racial-trait prose
+  // often bundles two grants of different power into one trait -- an
+  // immediate cantrip plus a leveled spell that only becomes usable later
+  // ("You know the Produce Flame cantrip... Once you reach 3rd level, you
+  // can cast the Burning Hands spell..."). A "cast" Activity has no
+  // level-prerequisite field of its own in dnd5e's data model, so nothing
+  // downstream can enforce this unless the gate is detected here first --
+  // confirmed real bug: Fire Genasi's Reach to the Blaze let a 1st-level
+  // character cast Burning Hands with no restriction at all, because
+  // nothing ever extracted "3rd level" from the text even though the
+  // phrase itself was already recognized (just to avoid a false-positive
+  // uses-count match below, not to capture the level it names).
+  // Deliberately narrow to the handful of confirmed real DDB phrasings
+  // (same "once/when you reach Nth level" shape already referenced in the
+  // uses-count comment below, plus "starting/beginning at Nth level") --
+  // each spell name found above (whichever source: structural <a
+  // href="/spell:..."> link or the textual castRe fallback) is matched to
+  // the NEAREST preceding gate phrase in the raw text; a spell mentioned
+  // before every gate (or with no gate at all) stays ungated, same as
+  // before this detector existed.
+  const spellLevelGates = {};
+  if (spellNames.length) {
+    const gateRe = /\b(?:(?:once|when|after)\s+you\s+reach|starting\s+at|beginning\s+at)\s+(?:character\s+level\s+(\d+)\b|(\d+)(?:st|nd|rd|th)\s+level\b)/gi;
+    const gates = [];
+    let gmatch;
+    while ((gmatch = gateRe.exec(text))) {
+      const level = parseInt(gmatch[1] ?? gmatch[2], 10);
+      if (Number.isFinite(level)) gates.push({ index: gmatch.index, level });
+    }
+    if (gates.length) {
+      const lowerText = text.toLowerCase();
+      for (const spellName of spellNames) {
+        const nameIdx = lowerText.indexOf(spellName.toLowerCase());
+        if (nameIdx === -1) continue;
+        const gate = gates.filter((g) => g.index < nameIdx).sort((a, b) => b.index - a.index)[0];
+        if (gate) spellLevelGates[spellName] = gate.level;
+      }
+    }
+  }
+
   const srIdx = text.search(/\bshort rest\b/i);
   const lrIdx = text.search(/\blong rest\b/i);
   let recoveryPeriod = null;
@@ -824,7 +864,7 @@ export function scanSegmentText(text, spellNames, index) {
   const activation = parseActivation(text);
   const { range, target } = parseRangeAndTarget(text);
 
-  return { usesFormula, recoveryPeriod, savingThrow, diceHints, effectHints: dedupedEffectHints, statusHints, toggleStatusHints, activation, range, target };
+  return { usesFormula, recoveryPeriod, savingThrow, diceHints, effectHints: dedupedEffectHints, statusHints, toggleStatusHints, activation, range, target, spellLevelGates };
 }
 
 // Best-guess mechanics scanner for a scraped feature's prose (used by the

@@ -249,6 +249,45 @@ function buildRaceTraitItemData({ name, description }, isLegacy, raceName) {
   };
 }
 
+// Companion item for a racial trait whose OWN text gates one particular
+// spell/cantrip grant behind a later character level (e.g. Fire Genasi's
+// Reach to the Blaze grants Produce Flame immediately but Burning Hands only
+// "once you reach 3rd level" — see scraper.mjs's spellLevelGates and
+// buildAutoMechanics' leveledActivities). A "cast" Activity has no
+// level-prerequisite field of its own in dnd5e's data model, so the only
+// mechanically-correct way to gate it is a separate item granted at that
+// level through its own ItemGrant advancement entry — importDdbRace buckets
+// this into traitsByLevel[level] exactly like any other trait, just keyed to
+// the level the text actually named instead of the parent trait's own grant
+// level. `prerequisites.level` mirrors buildDdbClassFeatureItemData's own
+// use of that field for a level-gated class feature — same established
+// pattern, not a new convention.
+export function buildRaceTraitSpellGrantItemData({ traitName, spellName, level, activityData, isLegacy, raceName }) {
+  return {
+    _id: randomId(),
+    name: `${traitName}: ${spellName}`,
+    type: "feat",
+    folder: null,
+    img: "icons/svg/upgrade.svg",
+    system: {
+      description: { value: "", chat: "" },
+      source: sourceField(isLegacy),
+      type: { value: "race", subtype: "" },
+      identifier: slugify(`${traitName}-${spellName}`),
+      requirements: raceName,
+      prerequisites: { level, repeatable: false },
+      properties: [],
+      uses: { max: "", spent: 0, recovery: [] },
+      activities: { [activityData._id]: activityData },
+      enchant: {},
+    },
+    effects: [],
+    flags: {},
+    _stats: baseStats(),
+    ownership: { default: 0 },
+  };
+}
+
 // Caller creates each trait's Feature item first (getting real UUIDs),
 // then passes { level: [{name, uuid}] } buckets in here — same two-step
 // flow importer.mjs already uses for freeform-generated subclass features.

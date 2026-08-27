@@ -1,7 +1,7 @@
 import { scrapeWikidotHtml, resolveSourceUrl, isWikidotPage, assembleSubclassItem, slugify, normalizeName, searchIndex, MODULE_ID, applyRulesetPreference, randomId } from "./scraper.mjs";
 import { scrapeFreeformSubclass } from "./freeform-scraper.mjs";
 import { showBuildFeatureDialog, buildAutoMechanics } from "./effects-builder.mjs";
-import { sendDdbAuth, fetchDdbGameData, assembleFeatItem, usableRacialTraits, findDuplicateTraitNameWarnings, assembleRaceTraitItem, assembleRaceItem, buildSizeAdvancement, mergeTraitDerivedMovement, featFolderSegments, raceTraitFolderSegments, raceFolderSegments, assembleClassItem, classFolderSegments, assembleSubclassItem as assembleDdbSubclassItem, subclassFolderSegments, buildDdbClassFeatureItemData, assembleBackgroundItem, assembleBackgroundFeatureItem, backgroundFolderSegments, backgroundFeatureFolderSegments } from "./ddb-scraper.mjs";
+import { sendDdbAuth, fetchDdbGameData, assembleFeatItem, usableRacialTraits, findDuplicateTraitNameWarnings, assembleRaceTraitItem, assembleRaceItem, buildRaceTraitSpellGrantItemData, buildSizeAdvancement, mergeTraitDerivedMovement, featFolderSegments, raceTraitFolderSegments, raceFolderSegments, assembleClassItem, classFolderSegments, assembleSubclassItem as assembleDdbSubclassItem, subclassFolderSegments, buildDdbClassFeatureItemData, assembleBackgroundItem, assembleBackgroundFeatureItem, backgroundFolderSegments, backgroundFeatureFolderSegments } from "./ddb-scraper.mjs";
 
 // Below this many detected "Nth Level:" headings, a freeform parse is
 // shown for review before creating anything — a strong sign the doc
@@ -1023,10 +1023,31 @@ async function importDdbRace(raceDef, index, report) {
       // importDdbFeat uses.
       const copied = await copyOfficialRaceTraitMechanics(data, raceDef, index, report);
       if (!copied) {
-        const { effects, activities, advancement } = buildAutoMechanics(data.system.description.value, index, data.name);
+        const { effects, activities, advancement, leveledActivities } = buildAutoMechanics(data.system.description.value, index, data.name);
         data.effects = effects;
         data.system.activities = activities;
         data.system.advancement = { ...(data.system.advancement ?? {}), ...advancement };
+        // A spell/cantrip grant this trait's own text gates behind a LATER
+        // character level (buildAutoMechanics' leveledActivities — e.g. Fire
+        // Genasi's Reach to the Blaze naming Burning Hands as available only
+        // "once you reach 3rd level") can't be represented on this item at
+        // all: a "cast" Activity has no level field, so leaving it here
+        // would grant it, ungated, the moment the whole trait is — exactly
+        // the "missing 3rd-level requirement" bug this pulls it back out to
+        // fix. Rebuilt instead as its own tiny item and bucketed into
+        // traitsByLevel below the same way every other trait already is,
+        // just keyed to the level the text actually named.
+        for (const { level, spellName, activityId } of leveledActivities) {
+          const activityData = data.system.activities[activityId];
+          if (!activityData) continue;
+          delete data.system.activities[activityId];
+          const grantData = buildRaceTraitSpellGrantItemData({ traitName: trait.name, spellName, level, activityData, isLegacy: raceDef.isLegacy, raceName: raceDef.fullName });
+          grantData.folder = traitsFolder;
+          const grantCreated = await Item.create(grantData);
+          if (!grantCreated) throw new Error(`Foundry rejected "${grantData.name}"'s data (check the browser console for a DataModelValidationError).`);
+          report.created.push({ name: grantCreated.name, uuid: grantCreated.uuid, file: `${raceDef.fullName} (trait)`, via: "ddb" });
+          (traitsByLevel[level] ??= []).push({ name: grantCreated.name, uuid: grantCreated.uuid });
+        }
       }
       const created = await Item.create(data);
       if (!created) throw new Error(`Foundry rejected trait "${trait.name}"'s data (check the browser console for a DataModelValidationError).`);
